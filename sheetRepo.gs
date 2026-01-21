@@ -25,6 +25,13 @@ class SheetRepo {
     return map;
   }
 
+  getConfigMonth(){
+    const sh = this.ss.getSheetByName("Config");
+    if (!sh) throw new Error("Missing sheet: Config");
+    const value = sh.getRange("B1").getValue();
+    return String(value).trim();
+  }
+
   writeSchedule(rows){
     const sh = this.ss.getSheetByName("Schedule") || this.ss.insertSheet("Schedule");
     sh.clearContents();
@@ -32,6 +39,13 @@ class SheetRepo {
     sh.getRange(1,1,1,headers.length).setValues([headers]);
     const data = rows.map(r => [r.date, r.shiftCode, r.empId, r.status]);
     if (data.length) sh.getRange(2,1,data.length,headers.length).setValues(data);
+  }
+
+  writeMonthSchedule(matrix, headers){
+    const sh = this.ss.getSheetByName("MonthSchedule") || this.ss.insertSheet("MonthSchedule");
+    sh.clearContents();
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    if (matrix.length) sh.getRange(2,1,matrix.length,headers.length).setValues(matrix);
   }
 
   read_(sheetName){
