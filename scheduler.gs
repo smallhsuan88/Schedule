@@ -18,6 +18,8 @@ class Scheduler {
 
     // counter: empId -> assignedCount (用於均衡)
     this.counter = new Map(this.people.map(p => [p.empId, 0]));
+
+    this.monthPlan = null;
   }
 
   generate() {
@@ -111,6 +113,89 @@ class Scheduler {
       }
     }
     return out;
+  }
+
+  buildMonthPlan(month) {
+    if (!month) throw new Error("Config month is required");
+    const [yearStr, monthStr] = String(month).split("-");
+    const year = Number(yearStr);
+    const monthIndex = Number(monthStr) - 1;
+    if (!year || Number.isNaN(monthIndex)) {
+      throw new Error(`Invalid month format: ${month}`);
+    }
+
+    const start = new Date(year, monthIndex, 1);
+    const end = new Date(year, monthIndex + 1, 0);
+    const daysInMonth = end.getDate();
+
+    const days = [];
+    for (let day = 1; day <= daysInMonth; day += 1) {
+      const date = new Date(year, monthIndex, day);
+      days.push({ day, dateKey: fmtDate(date) });
+    }
+
+    const plan = new Map();
+    for (const person of this.people) {
+      const byDate = new Map();
+      for (const { dateKey } of days) {
+        byDate.set(dateKey, "");
+      }
+      plan.set(person.empId, byDate);
+    }
+
+    for (const item of this.leave) {
+      const dateKey = fmtDate(item.date);
+      const byDate = plan.get(item.empId);
+      if (byDate && byDate.has(dateKey)) {
+        byDate.set(dateKey, item.leaveType);
+      }
+    }
+
+    for (const rule of this.fixedRules) {
+      const byDate = plan.get(rule.empId);
+      if (!byDate) continue;
+      const dates = expandDateRange(rule.dateFrom, rule.dateTo);
+      for (const date of dates) {
+        const dateKey = fmtDate(date);
+        if (!byDate.has(dateKey)) continue;
+        if (byDate.get(dateKey)) continue;
+        byDate.set(dateKey, rule.shiftCode);
+      }
+    }
+
+    const shiftCodes = Object.values(this.shiftDefs)
+      .filter(def => String(def.isOff || "").toUpperCase() !== "Y")
+      .map(def => def.shiftCode)
+      .filter(Boolean);
+
+    for (const person of this.people) {
+      const byDate = plan.get(person.empId);
+      if (!byDate) continue;
+      for (const { dateKey } of days) {
+        if (byDate.get(dateKey)) continue;
+        const picked = shiftCodes.length
+          ? shiftCodes[Math.floor(Math.random() * shiftCodes.length)]
+          : "";
+        byDate.set(dateKey, picked);
+      }
+    }
+
+    this.monthPlan = { month, days, plan };
+    return this.monthPlan;
+  }
+
+  toMonthMatrix() {
+    if (!this.monthPlan) throw new Error("Month plan not built");
+    const headers = ["empId", "name", ...this.monthPlan.days.map(d => d.day)];
+    const matrix = this.people.map(person => {
+      const byDate = this.monthPlan.plan.get(person.empId);
+      const row = [person.empId, person.name];
+      for (const { dateKey } of this.monthPlan.days) {
+        row.push(byDate ? byDate.get(dateKey) || "" : "");
+      }
+      return row;
+    });
+    return { headers, matrix };
   }
 }
 
