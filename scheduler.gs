@@ -116,6 +116,9 @@ class Scheduler {
   }
 
   buildMonthPlan(month) {
+    if (Object.prototype.toString.call(month) === "[object Date]" && !isNaN(month.getTime())) {
+      month = Utilities.formatDate(month, "Asia/Taipei", "yyyy-MM");
+    }
     if (!month) throw new Error("Config month is required");
     const [yearStr, monthStr] = String(month).split("-");
     const year = Number(yearStr);

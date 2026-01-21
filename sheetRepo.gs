@@ -28,8 +28,38 @@ class SheetRepo {
   getConfigMonth(){
     const sh = this.ss.getSheetByName("Config");
     if (!sh) throw new Error("Missing sheet: Config");
-    const value = sh.getRange("B1").getValue();
-    return String(value).trim();
+
+    const v = sh.getRange("B1").getValue(); // could be Date or string
+    if (v === "" || v === null) throw new Error("Config!B1 is empty");
+
+    // Date object -> yyyy-MM
+    if (Object.prototype.toString.call(v) === "[object Date]" && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, "Asia/Taipei", "yyyy-MM");
+    }
+
+    const s = String(v).trim();
+
+    // YYYY-MM
+    if (/^\d{4}-\d{2}$/.test(s)) return s;
+
+    // YYYY/MM
+    if (/^\d{4}\/\d{2}$/.test(s)) return s.replace("/", "-");
+
+    // YYYY-MM-DD or YYYY/MM/DD
+    const m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+    if (m) {
+      const yyyy = m[1];
+      const mm = String(m[2]).padStart(2, "0");
+      return `${yyyy}-${mm}`;
+    }
+
+    // Last resort: parse date-like strings
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) {
+      return Utilities.formatDate(d, "Asia/Taipei", "yyyy-MM");
+    }
+
+    throw new Error("Invalid month format in Config!B1. Use YYYY-MM (e.g., 2026-01) or a date within that month.");
   }
 
   writeSchedule(rows){
