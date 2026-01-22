@@ -134,7 +134,7 @@ class Scheduler {
     const days = [];
     for (let day = 1; day <= daysInMonth; day += 1) {
       const date = new Date(year, monthIndex, day);
-      days.push({ day, dateKey: fmtDate(date) });
+      days.push({ day, dateKey: fmtDate(date), date });
     }
 
     const plan = new Map();
@@ -163,6 +163,112 @@ class Scheduler {
         if (!byDate.has(dateKey)) continue;
         if (byDate.get(dateKey)) continue;
         byDate.set(dateKey, rule.shiftCode);
+      }
+    }
+
+    const monthStart = new Date(year, monthIndex, 1);
+    const weekBuckets = new Map();
+    for (const { date } of days) {
+      const idx = weekIndex_(date, monthStart);
+      if (!weekBuckets.has(idx)) weekBuckets.set(idx, []);
+      weekBuckets.get(idx).push(date);
+    }
+
+    const restCountR = new Map(this.people.map(p => [p.empId, 0]));
+    const restCountr = new Map(this.people.map(p => [p.empId, 0]));
+    let assignedR = 0;
+    let assignedr = 0;
+
+    const targetR = days.filter(({ date }) => dow_(date) === 0).length;
+    const targetr = days.filter(({ date }) => dow_(date) === 6).length;
+
+    const getRestTotal = empId => (restCountR.get(empId) || 0) + (restCountr.get(empId) || 0);
+    const pickRestCandidate = (dateKey, code) => {
+      const candidates = this.people
+        .map(p => p.empId)
+        .filter(empId => {
+          const byDate = plan.get(empId);
+          return byDate && byDate.get(dateKey) === "";
+        });
+      const getCodeCount = empId => (code === "R" ? restCountR.get(empId) : restCountr.get(empId)) || 0;
+      candidates.sort((a, b) => {
+        const totalDiff = getRestTotal(a) - getRestTotal(b);
+        if (totalDiff !== 0) return totalDiff;
+        const codeDiff = getCodeCount(a) - getCodeCount(b);
+        if (codeDiff !== 0) return codeDiff;
+        return Math.random() - 0.5;
+      });
+      return candidates[0] || null;
+    };
+
+    const assignRest = (empId, dateKey, code) => {
+      const byDate = plan.get(empId);
+      if (!byDate || byDate.get(dateKey) !== "") return false;
+      byDate.set(dateKey, code);
+      if (code === "R") {
+        restCountR.set(empId, (restCountR.get(empId) || 0) + 1);
+        assignedR += 1;
+      } else if (code === "r") {
+        restCountr.set(empId, (restCountr.get(empId) || 0) + 1);
+        assignedr += 1;
+      }
+      return true;
+    };
+
+    for (const { date, dateKey } of days.filter(({ date }) => dow_(date) === 0)) {
+      const empId = pickRestCandidate(dateKey, "R");
+      if (empId && assignRest(empId, dateKey, "R")) continue;
+      const weekIdx = weekIndex_(date, monthStart);
+      const weekDates = weekBuckets.get(weekIdx) || [];
+      let placed = false;
+      for (const weekDate of weekDates) {
+        const weekDateKey = fmtDate(weekDate);
+        const fallbackEmp = pickRestCandidate(weekDateKey, "R");
+        if (fallbackEmp && assignRest(fallbackEmp, weekDateKey, "R")) {
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        Logger.log(`[WARN] cannot place weekly R for week=${weekIdx} (Sunday ${dateKey})`);
+      }
+    }
+
+    for (const { date, dateKey } of days.filter(({ date }) => dow_(date) === 6)) {
+      const empId = pickRestCandidate(dateKey, "r");
+      if (empId) {
+        if (assignRest(empId, dateKey, "r")) continue;
+      }
+      Logger.log(`[WARN] cannot place monthly r for Saturday ${dateKey}`);
+    }
+
+    for (const [weekIdx, weekDates] of weekBuckets.entries()) {
+      const weekDateKeys = weekDates.map(d => fmtDate(d));
+      for (const person of this.people) {
+        const byDate = plan.get(person.empId);
+        if (!byDate) continue;
+        const hasRest = weekDateKeys.some(dateKey => {
+          const val = byDate.get(dateKey);
+          return val === "R" || val === "r";
+        });
+        if (hasRest) continue;
+        const availableDates = weekDateKeys.filter(dateKey => byDate.get(dateKey) === "");
+        if (!availableDates.length) {
+          Logger.log(`[WARN] cannot place weekly rest for empId=${person.empId} week=${weekIdx}`);
+          continue;
+        }
+        const pickDateKey = availableDates[Math.floor(Math.random() * availableDates.length)];
+        const remainingr = targetr - assignedr;
+        const remainingR = targetR - assignedR;
+        let code = null;
+        if (remainingr > 0) code = "r";
+        else if (remainingR > 0) code = "R";
+        else if (remainingr <= 0 && remainingR <= 0) {
+          Logger.log(`[WARN] rest quota reached, skip weekly rest for empId=${person.empId} week=${weekIdx}`);
+        }
+        if (code) {
+          assignRest(person.empId, pickDateKey, code);
+        }
       }
     }
 
@@ -213,4 +319,17 @@ function expandDateRange(from, to) {
   const out = [];
   for (let dt = new Date(start); dt <= end; dt.setDate(dt.getDate()+1)) out.push(new Date(dt));
   return out;
+}
+function dow_(dateObj) {
+  return new Date(dateObj).getDay();
+}
+function weekIndex_(dateObj, monthStart) {
+  const d0 = new Date(monthStart);
+  const d = new Date(dateObj);
+  let idx = 0;
+  for (let x = new Date(d0); x <= d; x.setDate(x.getDate() + 1)) {
+    if (x.getTime() === d0.getTime()) continue;
+    if (x.getDay() === 0) idx++;
+  }
+  return idx;
 }
