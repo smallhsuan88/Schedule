@@ -2,9 +2,13 @@
 class SheetRepo {
   constructor(ss){ this.ss = ss; }
 
-  getPeople(){ return this.read_("People").map(r => ({
-    empId: String(r.empId), name: r.name, active: (r.active === "Y")
-  }));}
+  getPeople(){
+    const rows = this.read_("People");
+    const activeKey = Object.keys(rows[0] || {}).find(k => String(k).toLowerCase().includes("active")) || "active";
+    return rows.map(r => ({
+      empId: String(r.empId), name: r.name, active: (r[activeKey] === "Y")
+    }));
+  }
 
   getFixedShifts(){ return this.read_("FixedShift").map(r => ({
     empId: String(r.empId), dateFrom: r.dateFrom, dateTo: r.dateTo, shiftCode: r.fixedShiftCode
