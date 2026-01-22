@@ -137,6 +137,83 @@ class Scheduler {
       days.push({ day, dateKey: fmtDate(date), date });
     }
 
+    const dayIndex = new Map(days.map((item, idx) => [item.dateKey, idx]));
+    const getDateKeyOffset = (dateKey, offset) => {
+      const idx = dayIndex.get(dateKey);
+      if (idx === undefined) return null;
+      const nextIdx = idx + offset;
+      if (nextIdx < 0 || nextIdx >= days.length) return null;
+      return days[nextIdx].dateKey;
+    };
+
+    const shiftByCode = new Map(Object.values(this.shiftDefs).map(def => [def.shiftCode, def]));
+    const parseTime_ = value => {
+      if (value instanceof Date && !isNaN(value.getTime())) {
+        return value.getHours() * 60 + value.getMinutes();
+      }
+      if (typeof value === "number" && !Number.isNaN(value)) {
+        return Math.round(value * 24 * 60);
+      }
+      if (typeof value === "string" && value.includes(":")) {
+        const [h, m] = value.split(":").map(Number);
+        if (!Number.isNaN(h) && !Number.isNaN(m)) return h * 60 + m;
+      }
+      return null;
+    };
+    const shiftStartEnd_ = (dateKey, shiftCode) => {
+      const def = shiftByCode.get(shiftCode);
+      if (!def) return null;
+      const startMinutes = parseTime_(def.startTime);
+      const endMinutes = parseTime_(def.endTime);
+      if (startMinutes === null || endMinutes === null) return null;
+      const start = new Date(dateKey);
+      start.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
+      const end = new Date(dateKey);
+      end.setHours(Math.floor(endMinutes / 60), endMinutes % 60, 0, 0);
+      if (endMinutes < startMinutes) {
+        end.setDate(end.getDate() + 1);
+      }
+      return { start, end, minRestHours: Number(def.minRestHours) || 11 };
+    };
+    const isOffCode_ = code => {
+      if (!code) return true;
+      if (code === "R" || code === "r") return true;
+      const def = shiftByCode.get(code);
+      if (!def) return true;
+      return String(def.isOff || "").toUpperCase() === "Y";
+    };
+    const canPlaceShift_ = (empId, dateKey, candidateShiftCode) => {
+      const byDate = plan.get(empId);
+      if (!byDate) return true;
+      const candidate = shiftStartEnd_(dateKey, candidateShiftCode);
+      if (!candidate) return false;
+
+      const prevDateKey = getDateKeyOffset(dateKey, -1);
+      if (prevDateKey) {
+        const prevCode = byDate.get(prevDateKey);
+        if (!isOffCode_(prevCode)) {
+          const prevShift = shiftStartEnd_(prevDateKey, prevCode);
+          if (prevShift) {
+            const hours = (candidate.start.getTime() - prevShift.end.getTime()) / 36e5;
+            if (hours < candidate.minRestHours) return false;
+          }
+        }
+      }
+
+      const nextDateKey = getDateKeyOffset(dateKey, 1);
+      if (nextDateKey) {
+        const nextCode = byDate.get(nextDateKey);
+        if (!isOffCode_(nextCode)) {
+          const nextShift = shiftStartEnd_(nextDateKey, nextCode);
+          if (nextShift) {
+            const hours = (nextShift.start.getTime() - candidate.end.getTime()) / 36e5;
+            if (hours < candidate.minRestHours) return false;
+          }
+        }
+      }
+      return true;
+    };
+
     const plan = new Map();
     for (const person of this.people) {
       const byDate = new Map();
@@ -174,32 +251,22 @@ class Scheduler {
       weekBuckets.get(idx).push(date);
     }
 
+    const sundays = days.filter(({ date }) => dow_(date) === 0);
+    const saturdays = days.filter(({ date }) => dow_(date) === 6);
+    const targetR = sundays.length;
+    const targetr = saturdays.length;
+
     const restCountR = new Map(this.people.map(p => [p.empId, 0]));
     const restCountr = new Map(this.people.map(p => [p.empId, 0]));
-    let assignedR = 0;
-    let assignedr = 0;
-
-    const targetR = days.filter(({ date }) => dow_(date) === 0).length;
-    const targetr = days.filter(({ date }) => dow_(date) === 6).length;
-
-    const getRestTotal = empId => (restCountR.get(empId) || 0) + (restCountr.get(empId) || 0);
-    const pickRestCandidate = (dateKey, code) => {
-      const candidates = this.people
-        .map(p => p.empId)
-        .filter(empId => {
-          const byDate = plan.get(empId);
-          return byDate && byDate.get(dateKey) === "";
-        });
-      const getCodeCount = empId => (code === "R" ? restCountR.get(empId) : restCountr.get(empId)) || 0;
-      candidates.sort((a, b) => {
-        const totalDiff = getRestTotal(a) - getRestTotal(b);
-        if (totalDiff !== 0) return totalDiff;
-        const codeDiff = getCodeCount(a) - getCodeCount(b);
-        if (codeDiff !== 0) return codeDiff;
-        return Math.random() - 0.5;
-      });
-      return candidates[0] || null;
-    };
+    for (const person of this.people) {
+      const byDate = plan.get(person.empId);
+      if (!byDate) continue;
+      for (const { dateKey } of days) {
+        const val = byDate.get(dateKey);
+        if (val === "R") restCountR.set(person.empId, (restCountR.get(person.empId) || 0) + 1);
+        if (val === "r") restCountr.set(person.empId, (restCountr.get(person.empId) || 0) + 1);
+      }
+    }
 
     const assignRest = (empId, dateKey, code) => {
       const byDate = plan.get(empId);
@@ -207,85 +274,102 @@ class Scheduler {
       byDate.set(dateKey, code);
       if (code === "R") {
         restCountR.set(empId, (restCountR.get(empId) || 0) + 1);
-        assignedR += 1;
       } else if (code === "r") {
         restCountr.set(empId, (restCountr.get(empId) || 0) + 1);
-        assignedr += 1;
       }
       return true;
     };
 
-    for (const { date, dateKey } of days.filter(({ date }) => dow_(date) === 0)) {
-      const empId = pickRestCandidate(dateKey, "R");
-      if (empId && assignRest(empId, dateKey, "R")) continue;
-      const weekIdx = weekIndex_(date, monthStart);
-      const weekDates = weekBuckets.get(weekIdx) || [];
-      let placed = false;
-      for (const weekDate of weekDates) {
-        const weekDateKey = fmtDate(weekDate);
-        const fallbackEmp = pickRestCandidate(weekDateKey, "R");
-        if (fallbackEmp && assignRest(fallbackEmp, weekDateKey, "R")) {
-          placed = true;
-          break;
-        }
-      }
-      if (!placed) {
-        Logger.log(`[WARN] cannot place weekly R for week=${weekIdx} (Sunday ${dateKey})`);
-      }
-    }
-
-    for (const { date, dateKey } of days.filter(({ date }) => dow_(date) === 6)) {
-      const empId = pickRestCandidate(dateKey, "r");
-      if (empId) {
-        if (assignRest(empId, dateKey, "r")) continue;
-      }
-      Logger.log(`[WARN] cannot place monthly r for Saturday ${dateKey}`);
-    }
-
-    for (const [weekIdx, weekDates] of weekBuckets.entries()) {
-      const weekDateKeys = weekDates.map(d => fmtDate(d));
+    const assignRestDaysPerEmployee = () => {
       for (const person of this.people) {
         const byDate = plan.get(person.empId);
         if (!byDate) continue;
-        const hasRest = weekDateKeys.some(dateKey => {
-          const val = byDate.get(dateKey);
-          return val === "R" || val === "r";
-        });
-        if (hasRest) continue;
-        const availableDates = weekDateKeys.filter(dateKey => byDate.get(dateKey) === "");
-        if (!availableDates.length) {
-          Logger.log(`[WARN] cannot place weekly rest for empId=${person.empId} week=${weekIdx}`);
-          continue;
+
+        for (const { dateKey } of sundays) {
+          assignRest(person.empId, dateKey, "R");
         }
-        const pickDateKey = availableDates[Math.floor(Math.random() * availableDates.length)];
-        const remainingr = targetr - assignedr;
-        const remainingR = targetR - assignedR;
-        let code = null;
-        if (remainingr > 0) code = "r";
-        else if (remainingR > 0) code = "R";
-        else if (remainingr <= 0 && remainingR <= 0) {
-          Logger.log(`[WARN] rest quota reached, skip weekly rest for empId=${person.empId} week=${weekIdx}`);
+
+        for (const { dateKey } of saturdays) {
+          assignRest(person.empId, dateKey, "r");
         }
-        if (code) {
-          assignRest(person.empId, pickDateKey, code);
+
+        const fillQuota = (code, target) => {
+          const count = code === "R" ? restCountR.get(person.empId) || 0 : restCountr.get(person.empId) || 0;
+          if (count >= target) return;
+          for (const { dateKey } of days) {
+            if (code === "R" && (restCountR.get(person.empId) || 0) >= target) break;
+            if (code === "r" && (restCountr.get(person.empId) || 0) >= target) break;
+            assignRest(person.empId, dateKey, code);
+          }
+          const afterCount = code === "R" ? restCountR.get(person.empId) || 0 : restCountr.get(person.empId) || 0;
+          if (afterCount < target) {
+            Logger.log(`[WARN] cannot fill ${code} quota for empId=${person.empId} target=${target} actual=${afterCount}`);
+          }
+        };
+
+        fillQuota("R", targetR);
+        fillQuota("r", targetr);
+
+        for (const [weekIdx, weekDates] of weekBuckets.entries()) {
+          const weekDateKeys = weekDates.map(d => fmtDate(d));
+          const hasR = weekDateKeys.some(dateKey => byDate.get(dateKey) === "R");
+          const hasRest = weekDateKeys.some(dateKey => {
+            const val = byDate.get(dateKey);
+            return val === "R" || val === "r";
+          });
+
+          let currentHasRest = hasRest;
+          if (!hasR) {
+            const sundayKey = weekDates.find(d => dow_(d) === 0);
+            const preferredKey = sundayKey ? fmtDate(sundayKey) : null;
+            const candidates = weekDateKeys.filter(dateKey => byDate.get(dateKey) === "");
+            const pickKey = (preferredKey && byDate.get(preferredKey) === "") ? preferredKey : candidates[0];
+            if (pickKey) {
+              assignRest(person.empId, pickKey, "R");
+              currentHasRest = true;
+            } else {
+              Logger.log(`[WARN] cannot place weekly R for empId=${person.empId} week=${weekIdx}`);
+            }
+          }
+
+          if (!currentHasRest) {
+            const candidates = weekDateKeys.filter(dateKey => byDate.get(dateKey) === "");
+            const pickKey = candidates[0];
+            if (pickKey) {
+              const remainingr = targetr - (restCountr.get(person.empId) || 0);
+              const remainingR = targetR - (restCountR.get(person.empId) || 0);
+              const code = remainingr > 0 ? "r" : remainingR > 0 ? "R" : "R";
+              assignRest(person.empId, pickKey, code);
+            } else {
+              Logger.log(`[WARN] cannot place weekly rest for empId=${person.empId} week=${weekIdx}`);
+            }
+          }
         }
       }
-    }
+    };
+
+    assignRestDaysPerEmployee();
 
     const shiftCodes = Object.values(this.shiftDefs)
       .filter(def => String(def.isOff || "").toUpperCase() !== "Y")
       .map(def => def.shiftCode)
-      .filter(Boolean);
+      .filter(code => code && !String(code).includes("常夜"));
 
     for (const person of this.people) {
       const byDate = plan.get(person.empId);
       if (!byDate) continue;
       for (const { dateKey } of days) {
         if (byDate.get(dateKey)) continue;
-        const picked = shiftCodes.length
-          ? shiftCodes[Math.floor(Math.random() * shiftCodes.length)]
-          : "";
-        byDate.set(dateKey, picked);
+        const available = shiftCodes.filter(code => canPlaceShift_(person.empId, dateKey, code));
+        if (available.length) {
+          const picked = available[Math.floor(Math.random() * available.length)];
+          byDate.set(dateKey, picked);
+        } else {
+          const dateObj = new Date(dateKey);
+          const fallback = dow_(dateObj) === 6 ? "r" : "R";
+          byDate.set(dateKey, fallback);
+          Logger.log(`[WARN] no shift meets min rest for empId=${person.empId} date=${dateKey}, fallback=${fallback}`);
+        }
       }
     }
 
