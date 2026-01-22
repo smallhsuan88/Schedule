@@ -74,8 +74,73 @@ class SheetRepo {
   writeMonthSchedule(matrix, headers){
     const sh = this.ss.getSheetByName("MonthSchedule") || this.ss.insertSheet("MonthSchedule");
     sh.clearContents();
-    sh.getRange(1,1,1,headers.length).setValues([headers]);
-    if (matrix.length) sh.getRange(2,1,matrix.length,headers.length).setValues(matrix);
+    const headerRows = Array.isArray(headers[0]) ? headers : [headers];
+    sh.getRange(1, 1, headerRows.length, headerRows[0].length).setValues(headerRows);
+    if (matrix.length) sh.getRange(1 + headerRows.length, 1, matrix.length, headerRows[0].length).setValues(matrix);
+  }
+
+  getExistingSchedule(windowStartDate, windowEndDate){
+    const windowStart = new Date(windowStartDate);
+    const windowEnd = new Date(windowEndDate);
+    const monthStarts = [];
+    for (let dt = new Date(windowStart.getFullYear(), windowStart.getMonth(), 1);
+      dt <= windowEnd;
+      dt.setMonth(dt.getMonth() + 1)) {
+      monthStarts.push(new Date(dt.getFullYear(), dt.getMonth(), 1));
+    }
+    const midDate = new Date(windowStart.getTime() + (windowEnd.getTime() - windowStart.getTime()) / 2);
+    const midMonthStart = new Date(midDate.getFullYear(), midDate.getMonth(), 1);
+    const seedMatrix = new Map();
+    const candidateSheets = this.ss.getSheets().filter(sh => {
+      const name = sh.getName();
+      return name === "MonthSchedule" || name.startsWith("MonthSchedule_");
+    });
+    for (const sh of candidateSheets) {
+      const sheetName = sh.getName();
+      let baseMonth = null;
+      const suffixMatch = sheetName.match(/^MonthSchedule_(\d{4})-(\d{2})$/);
+      if (suffixMatch) {
+        baseMonth = new Date(Number(suffixMatch[1]), Number(suffixMatch[2]) - 1, 1);
+      }
+      const values = sh.getDataRange().getValues();
+      if (values.length < 3) continue;
+      const headerRow = values[0] || [];
+      const secondRow = values[1] || [];
+      const dayRow = Number(secondRow[2]) ? secondRow : headerRow;
+      const dayNumbers = dayRow.slice(2).map(v => Number(v)).filter(v => !Number.isNaN(v));
+      if (!baseMonth) {
+        const midDaysInMonth = new Date(midMonthStart.getFullYear(), midMonthStart.getMonth() + 1, 0).getDate();
+        if (dayNumbers.length === midDaysInMonth) {
+          baseMonth = midMonthStart;
+        } else {
+          const monthCandidates = monthStarts.filter(monthStart => {
+            const daysInMonth = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 0).getDate();
+            return dayNumbers.length === daysInMonth;
+          });
+          baseMonth = monthCandidates[0] || null;
+        }
+      }
+      if (!baseMonth) continue;
+      const year = baseMonth.getFullYear();
+      const month = baseMonth.getMonth();
+      for (let rowIdx = 2; rowIdx < values.length; rowIdx += 1) {
+        const row = values[rowIdx];
+        const empId = String(row[0] || "").trim();
+        if (!empId) continue;
+        if (!seedMatrix.has(empId)) seedMatrix.set(empId, new Map());
+        const byDate = seedMatrix.get(empId);
+        for (let colIdx = 2; colIdx < row.length && colIdx - 2 < dayNumbers.length; colIdx += 1) {
+          const dayNum = dayNumbers[colIdx - 2];
+          if (!dayNum) continue;
+          const date = new Date(year, month, dayNum);
+          if (date < windowStart || date > windowEnd) continue;
+          const code = row[colIdx];
+          if (code === "" || code === null) continue;
+          byDate.set(Utilities.formatDate(date, "Asia/Taipei", "yyyy-MM-dd"), code);
+        }
+      }
+    }
+    return seedMatrix;
   }
 
   read_(sheetName){
