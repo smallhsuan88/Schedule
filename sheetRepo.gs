@@ -5,8 +5,22 @@ class SheetRepo {
   getPeople(){
     const rows = this.read_("People");
     const activeKey = Object.keys(rows[0] || {}).find(k => String(k).toLowerCase().includes("active")) || "active";
+    const pickNumber = (row, keys) => {
+      for (const key of keys) {
+        if (row[key] === "" || row[key] === null || row[key] === undefined) continue;
+        const value = Number(row[key]);
+        if (!Number.isNaN(value)) return value;
+      }
+      return null;
+    };
     return rows.map(r => ({
-      empId: String(r.empId), name: r.name, active: (r[activeKey] === "Y")
+      empId: String(r.empId),
+      name: r.name,
+      active: (r[activeKey] === "Y"),
+      quotaSun: pickNumber(r, ["quotaSun", "quota_sun", "R_sun", "sunQuota"]),
+      quotaSat: pickNumber(r, ["quotaSat", "quota_sat", "R_sat", "satQuota"]),
+      quotaOffTotal: pickNumber(r, ["quotaOffTotal", "quota_off_total", "offQuota", "offTotal"]),
+      monthlyOff: pickNumber(r, ["monthlyOff", "monthOff", "offDays"])
     }));
   }
 
