@@ -151,7 +151,12 @@ class Scheduler {
       return days[nextIdx].dateKey;
     };
 
+    // 在任何情況下，不得為了塞滿 R/r 配額而讓某天 off 人數 > 2 或造成當天缺早/午/夜；若配額與 coverage 衝突，優先維持 daily coverage，並將無法安置的 R/r 以 warning 回報。
     const shiftByCode = new Map(Object.values(this.shiftDefs).map(def => [def.shiftCode, def]));
+    const FIXED_NIGHT_EMP_ID = "T00128";
+    const hasFixedNightRule = this.fixedRules.some(rule => rule.empId === FIXED_NIGHT_EMP_ID);
+    const fixedNightEmpSet = new Set(hasFixedNightRule ? [FIXED_NIGHT_EMP_ID] : []);
+    const leaveTypes = new Set(this.leave.map(item => item.leaveType).filter(Boolean));
     const parseTime_ = value => {
       if (value instanceof Date && !isNaN(value.getTime())) {
         return value.getHours() * 60 + value.getMinutes();
@@ -180,18 +185,13 @@ class Scheduler {
       }
       return { start, end, minRestHours: Number(def.minRestHours) || 11 };
     };
-    const isWorkShift_ = code => {
-      if (!code) return false;
-      if (code === "R" || code === "r") return false;
-      const def = shiftByCode.get(code);
-      if (!def) return false;
-      return String(def.isOff || "").toUpperCase() !== "Y";
-    };
     const isLeaveCode_ = code => {
       if (!code) return false;
       if (code === "R" || code === "r") return false;
-      return !shiftByCode.has(code);
+      return leaveTypes.has(code) || !shiftByCode.has(code);
     };
+    const isOffCode = code => code === "R" || code === "r" || isLeaveCode_(code);
+    const isWorkCode = code => Boolean(code) && !isOffCode(code);
     const isNightCode_ = code => code === "夜" || code === "夜L" || String(code || "").includes("常夜");
     const isEarlyCode_ = code => code === "早" || code === "早L";
     const isNoonCode_ = code => code === "午" || code === "午L";
@@ -235,29 +235,15 @@ class Scheduler {
     const monthSundayCount = sundayIdx.length;
     const monthSaturdayCount = saturdayIdx.length;
 
-    const dayNeed = {};
     const dayAssigned = {};
     const nightTaken = {};
-    const fixedNightEmpSet = new Set(
-      this.fixedRules.filter(rule => String(rule.shiftCode || "").includes("常夜")).map(rule => rule.empId)
-    );
     for (const { dateKey } of days) {
-      dayNeed[dateKey] = { early: 1, noon: 1, night: 1 };
       dayAssigned[dateKey] = { early: 0, noon: 0, night: 0 };
       nightTaken[dateKey] = false;
     }
 
-    const getPreferredShift = (empId, dateKey) => {
-      for (const rule of this.fixedRules) {
-        if (rule.empId !== empId) continue;
-        const dates = expandDateRange(rule.dateFrom, rule.dateTo).map(fmtDate);
-        if (dates.includes(dateKey)) return rule.shiftCode || null;
-      }
-      return null;
-    };
-
     const minRestOk_ = (prevDateKey, prevCode, curDateKey, curCode, minHours = 11) => {
-      if (!isWorkShift_(prevCode) || !isWorkShift_(curCode)) return true;
+      if (!isWorkCode(prevCode) || !isWorkCode(curCode)) return true;
       const prevShift = shiftStartEnd_(prevDateKey, prevCode);
       const curShift = shiftStartEnd_(curDateKey, curCode);
       if (!prevShift || !curShift) return false;
@@ -265,9 +251,17 @@ class Scheduler {
       return hours >= minHours;
     };
 
-    const canPlaceShift_ = (empId, dateKey, candidateShiftCode, options = {}) => {
+    const canPlaceShift = (empId, dateKey, candidateShiftCode, options = {}) => {
       const byDate = plan.get(empId);
-      if (!byDate) return true;
+      if (!byDate) return false;
+      if (byDate.get(dateKey) !== "") return false;
+      if (!shiftByCode.has(candidateShiftCode)) return false;
+      if (hasFixedNightRule && empId === FIXED_NIGHT_EMP_ID && isWorkCode(candidateShiftCode) && candidateShiftCode !== "常夜") {
+        return false;
+      }
+      if (String(candidateShiftCode || "").includes("常夜") && (!hasFixedNightRule || empId !== FIXED_NIGHT_EMP_ID)) {
+        return false;
+      }
       const candidate = shiftStartEnd_(dateKey, candidateShiftCode);
       if (!candidate) return false;
       if (isNightCode_(candidateShiftCode) && nightTaken[dateKey] && !options.ignoreNightCap) return false;
@@ -286,6 +280,26 @@ class Scheduler {
       return true;
     };
 
+    const countOffPeople = dateKey => {
+      let count = 0;
+      for (const person of this.people) {
+        const code = plan.get(person.empId).get(dateKey);
+        if (isOffCode(code)) count += 1;
+      }
+      return count;
+    };
+
+    const pickCandidateForShift = (dateKey, shiftCode, excludeEmpIds = new Set()) => {
+      for (const person of this.people) {
+        if (excludeEmpIds.has(person.empId)) continue;
+        const byDate = plan.get(person.empId);
+        if (!byDate || byDate.get(dateKey) !== "") continue;
+        if (!canPlaceShift(person.empId, dateKey, shiftCode)) continue;
+        return person.empId;
+      }
+      return null;
+    };
+
     const restCountR = new Map(this.people.map(p => [p.empId, 0]));
     const restCountr = new Map(this.people.map(p => [p.empId, 0]));
 
@@ -294,6 +308,7 @@ class Scheduler {
       const byDate = plan.get(empId);
       if (!byDate || byDate.get(dateKey) !== "") return false;
       if (this.leaveSet.has(`${empId}#${dateKey}`)) return false;
+      if (countOffPeople(dateKey) >= 2) return false;
       byDate.set(dateKey, code);
       if (code === "R") {
         restCountR.set(empId, (restCountR.get(empId) || 0) + 1);
@@ -311,6 +326,7 @@ class Scheduler {
       if (byDate.get(fromKey) !== code) return false;
       if (byDate.get(toKey) !== "") return false;
       if (this.leaveSet.has(`${empId}#${toKey}`)) return false;
+      if (countOffPeople(toKey) >= 2) return false;
       byDate.set(fromKey, "");
       byDate.set(toKey, code);
       return true;
@@ -329,14 +345,14 @@ class Scheduler {
       if (!shiftByCode.has(shiftCode)) return false;
       if (plan.get(empId).get(dateKey) !== "") return false;
       if (String(shiftCode || "").includes("常夜") && !fixedNightEmpSet.has(empId)) return false;
-      if (!canPlaceShift_(empId, dateKey, shiftCode)) return false;
+      if (!canPlaceShift(empId, dateKey, shiftCode)) return false;
       if (isNightCode_(shiftCode) && nightTaken[dateKey]) return false;
       plan.get(empId).set(dateKey, shiftCode);
       markAssigned(dateKey, shiftCode);
       return true;
     };
 
-    // Phase B: Leave
+    // Phase A: Leave (do not overwrite)
     for (const item of this.leave) {
       const dateKey = fmtDate(item.date);
       const byDate = plan.get(item.empId);
@@ -345,7 +361,74 @@ class Scheduler {
       }
     }
 
-    // Phase C1: place monthly R/r quotas
+    for (const { dateKey } of days) {
+      let leaveCount = 0;
+      for (const person of this.people) {
+        const code = plan.get(person.empId).get(dateKey);
+        if (isLeaveCode_(code)) leaveCount += 1;
+      }
+      const availableWorkers = this.people.length - leaveCount;
+      if (availableWorkers < 3) {
+        Logger.log(`[WARN] coverage impossible date=${dateKey} leaveCount=${leaveCount}`);
+      }
+    }
+
+    // Phase B: lock daily coverage slots (early/noon/night)
+    for (const { dateKey } of days) {
+      let nightLocked = false;
+      if (hasFixedNightRule && fixedNightEmpSet.has(FIXED_NIGHT_EMP_ID)) {
+        const byDate = plan.get(FIXED_NIGHT_EMP_ID);
+        if (byDate && byDate.get(dateKey) === "") {
+          if (shiftByCode.has("常夜") && placeShift(FIXED_NIGHT_EMP_ID, dateKey, "常夜")) {
+            nightLocked = true;
+          } else {
+            Logger.log(`[WARN] coverage lock failed date=${dateKey} missing=night`);
+          }
+        }
+      }
+
+      if (!nightLocked) {
+        if (shiftByCode.has(coverageShiftCodes.night)) {
+          const nightCandidate = pickCandidateForShift(
+            dateKey,
+            coverageShiftCodes.night,
+            new Set(fixedNightEmpSet)
+          );
+          if (nightCandidate) {
+            placeShift(nightCandidate, dateKey, coverageShiftCodes.night);
+            nightLocked = true;
+          } else {
+            Logger.log(`[WARN] coverage lock failed date=${dateKey} missing=night`);
+          }
+        } else {
+          Logger.log(`[WARN] coverage lock failed date=${dateKey} missing=night`);
+        }
+      }
+
+      if (shiftByCode.has(coverageShiftCodes.early)) {
+        const earlyCandidate = pickCandidateForShift(dateKey, coverageShiftCodes.early);
+        if (earlyCandidate) {
+          placeShift(earlyCandidate, dateKey, coverageShiftCodes.early);
+        } else {
+          Logger.log(`[WARN] coverage lock failed date=${dateKey} missing=early`);
+        }
+      } else {
+        Logger.log(`[WARN] coverage lock failed date=${dateKey} missing=early`);
+      }
+
+      if (shiftByCode.has(coverageShiftCodes.noon)) {
+        const noonCandidate = pickCandidateForShift(dateKey, coverageShiftCodes.noon);
+        if (noonCandidate) {
+          placeShift(noonCandidate, dateKey, coverageShiftCodes.noon);
+        } else {
+          Logger.log(`[WARN] coverage lock failed date=${dateKey} missing=noon`);
+        }
+      } else {
+        Logger.log(`[WARN] coverage lock failed date=${dateKey} missing=noon`);
+      }
+    }
+
+    // Phase C1: place monthly R/r quotas (only on unassigned, non-leave slots)
     for (const person of this.people) {
       const missingSundays = [];
       for (const idx of sundayIdx) {
@@ -372,11 +455,10 @@ class Scheduler {
         if (plan.get(person.empId).get(dateKeys[idx]) === "R") continue;
         assignRest(person.empId, idx, "r");
       }
-      if ((restCountR.get(person.empId) || 0) < monthSundayCount) {
-        Logger.log(`[WARN] cannot fill R quota for empId=${person.empId} target=${monthSundayCount} actual=${restCountR.get(person.empId) || 0}`);
-      }
-      if ((restCountr.get(person.empId) || 0) < monthSaturdayCount) {
-        Logger.log(`[WARN] cannot fill r quota for empId=${person.empId} target=${monthSaturdayCount} actual=${restCountr.get(person.empId) || 0}`);
+      const missingR = monthSundayCount - (restCountR.get(person.empId) || 0);
+      const missingr = monthSaturdayCount - (restCountr.get(person.empId) || 0);
+      if (missingR > 0 || missingr > 0) {
+        Logger.log(`[WARN] cannot place monthly R/r quota empId=${person.empId} missingR=${Math.max(0, missingR)} missingr=${Math.max(0, missingr)}`);
       }
     }
 
@@ -387,23 +469,26 @@ class Scheduler {
       for (const bucket of weekBucketsIdx) {
         const hasR = bucket.some(idx => byDate.get(dateKeys[idx]) === "R");
         if (hasR) continue;
-        const targetIdx = bucket.find(idx => byDate.get(dateKeys[idx]) === "" && !this.leaveSet.has(`${person.empId}#${dateKeys[idx]}`));
-        if (targetIdx === undefined) {
-          Logger.log(`[WARN] cannot place weekly R for empId=${person.empId} week=${dateKeys[bucket[0]]}`);
-          continue;
+        let placed = false;
+        if ((restCountR.get(person.empId) || 0) < monthSundayCount) {
+          const targetIdx = bucket.find(idx => assignRest(person.empId, idx, "R"));
+          placed = targetIdx !== undefined;
         }
-
-        let moved = false;
-        for (const donorBucket of weekBucketsIdx) {
-          const donorR = donorBucket.filter(idx => byDate.get(dateKeys[idx]) === "R");
-          if (donorR.length <= 1) continue;
-          if (moveRestWithinMonth_(person.empId, donorR[0], targetIdx, "R")) {
-            moved = true;
-            break;
+        if (!placed) {
+          let moved = false;
+          for (const donorBucket of weekBucketsIdx) {
+            const donorR = donorBucket.filter(idx => byDate.get(dateKeys[idx]) === "R");
+            if (donorR.length <= 1) continue;
+            const slotIdx = bucket.find(idx => byDate.get(dateKeys[idx]) === "" && !this.leaveSet.has(`${person.empId}#${dateKeys[idx]}`));
+            if (slotIdx === undefined) continue;
+            if (moveRestWithinMonth_(person.empId, donorR[0], slotIdx, "R")) {
+              moved = true;
+              break;
+            }
           }
-        }
-        if (!moved) {
-          Logger.log(`[WARN] cannot move weekly R for empId=${person.empId} week=${dateKeys[bucket[0]]}`);
+          if (!moved) {
+            Logger.log(`[WARN] cannot place weekly R for empId=${person.empId} week=${dateKeys[bucket[0]]}`);
+          }
         }
       }
     }
@@ -423,20 +508,22 @@ class Scheduler {
           }
         }
         if (hasRest) continue;
-        const targetIdx = (() => {
-          for (let idx = startIdx; idx <= endIdx; idx += 1) {
-            const dateKey = dateKeys[idx];
-            if (byDate.get(dateKey) === "" && !this.leaveSet.has(`${person.empId}#${dateKey}`)) return idx;
+        let targetIdx = null;
+        for (let idx = startIdx; idx <= endIdx; idx += 1) {
+          if (plan.get(person.empId).get(dateKeys[idx]) === "" && countOffPeople(dateKeys[idx]) < 2) {
+            targetIdx = idx;
+            break;
           }
-          return null;
-        })();
+        }
         if (targetIdx === null) {
           Logger.log(`[WARN] cannot enforce 7-day rest window empId=${person.empId} range=${dateKeys[startIdx]}~${dateKeys[endIdx]}`);
           continue;
         }
 
         if ((restCountr.get(person.empId) || 0) < monthSaturdayCount) {
-          assignRest(person.empId, targetIdx, "r");
+          if (!assignRest(person.empId, targetIdx, "r")) {
+            Logger.log(`[WARN] cannot place r for 7-day rest window empId=${person.empId} range=${dateKeys[startIdx]}~${dateKeys[endIdx]}`);
+          }
           continue;
         }
 
@@ -450,76 +537,16 @@ class Scheduler {
             }
           }
         }
+        if (!moved && (restCountR.get(person.empId) || 0) < monthSundayCount) {
+          if (assignRest(person.empId, targetIdx, "R")) moved = true;
+        }
         if (!moved) {
-          Logger.log(`[WARN] cannot move r into 7-day rest window empId=${person.empId} range=${dateKeys[startIdx]}~${dateKeys[endIdx]}`);
+          Logger.log(`[WARN] cannot move rest into 7-day rest window empId=${person.empId} range=${dateKeys[startIdx]}~${dateKeys[endIdx]}`);
         }
       }
     }
 
-    const generalShiftPool = [coverageShiftCodes.early, coverageShiftCodes.noon, coverageShiftCodes.night]
-      .filter(code => shiftByCode.has(code));
-    if (!generalShiftPool.length) {
-      for (const def of Object.values(this.shiftDefs)) {
-        if (String(def.isOff || "").toUpperCase() === "Y") continue;
-        if (String(def.shiftCode || "").includes("常夜")) continue;
-        if (!generalShiftPool.includes(def.shiftCode)) generalShiftPool.push(def.shiftCode);
-      }
-    }
-
-    // Phase D1: fixed night preference
-    if (shiftByCode.has("常夜")) {
-      for (const person of this.people) {
-        if (!fixedNightEmpSet.has(person.empId)) continue;
-        const byDate = plan.get(person.empId);
-        if (!byDate) continue;
-        for (const { dateKey } of days) {
-          if (byDate.get(dateKey) !== "") continue;
-          placeShift(person.empId, dateKey, "常夜");
-        }
-      }
-    }
-
-    // Phase D2: daily coverage (early/noon/night)
-    for (const { dateKey } of days) {
-      const available = () => this.people
-        .map(p => p.empId)
-        .filter(empId => !this.leaveSet.has(`${empId}#${dateKey}`))
-        .filter(empId => plan.get(empId).get(dateKey) === "");
-
-      const fillCoverage = (shiftCode, options = {}) => {
-        const candidates = available()
-          .filter(empId => (options.requireFixedNight ? fixedNightEmpSet.has(empId) : true));
-        for (const empId of candidates) {
-          if (placeShift(empId, dateKey, shiftCode)) return true;
-        }
-        return false;
-      };
-
-      const assigned = dayAssigned[dateKey];
-      if (assigned.early < dayNeed[dateKey].early) {
-        if (!shiftByCode.has(coverageShiftCodes.early) || !fillCoverage(coverageShiftCodes.early)) {
-          Logger.log(`[WARN] coverage unmet date=${dateKey} missing=early`);
-        }
-      }
-      if (assigned.noon < dayNeed[dateKey].noon) {
-        if (!shiftByCode.has(coverageShiftCodes.noon) || !fillCoverage(coverageShiftCodes.noon)) {
-          Logger.log(`[WARN] coverage unmet date=${dateKey} missing=noon`);
-        }
-      }
-      if (assigned.night < dayNeed[dateKey].night) {
-        let nightFilled = false;
-        if (shiftByCode.has("常夜")) {
-          nightFilled = fillCoverage("常夜", { requireFixedNight: true });
-        }
-        if (!nightFilled) {
-          if (!shiftByCode.has(coverageShiftCodes.night) || !fillCoverage(coverageShiftCodes.night)) {
-            Logger.log(`[WARN] coverage unmet date=${dateKey} missing=night`);
-          }
-        }
-      }
-    }
-
-    // Phase D3: fill remaining shifts
+    // Phase D: fill remaining shifts (no night beyond night-cap)
     for (const person of this.people) {
       const byDate = plan.get(person.empId);
       if (!byDate) continue;
@@ -530,11 +557,10 @@ class Scheduler {
           if (placeShift(person.empId, dateKey, "常夜")) placed = true;
         }
         if (!placed) {
-          for (const code of generalShiftPool) {
-            if (placeShift(person.empId, dateKey, code)) {
-              placed = true;
-              break;
-            }
+          if (shiftByCode.has(coverageShiftCodes.early) && placeShift(person.empId, dateKey, coverageShiftCodes.early)) {
+            placed = true;
+          } else if (shiftByCode.has(coverageShiftCodes.noon) && placeShift(person.empId, dateKey, coverageShiftCodes.noon)) {
+            placed = true;
           }
         }
         if (!placed) {
@@ -544,6 +570,26 @@ class Scheduler {
     }
 
     const validatePlan = () => {
+      for (const { dateKey } of days) {
+        let earlyCount = 0;
+        let noonCount = 0;
+        let nightCount = 0;
+        let offCount = 0;
+        for (const person of this.people) {
+          const code = plan.get(person.empId).get(dateKey);
+          if (isOffCode(code)) offCount += 1;
+          if (isEarlyCode_(code)) earlyCount += 1;
+          if (isNoonCode_(code)) noonCount += 1;
+          if (isNightCode_(code)) nightCount += 1;
+        }
+        if (earlyCount < 1 || noonCount < 1 || nightCount !== 1) {
+          Logger.log(`[VIOLATION] date=${dateKey} type=daily_coverage details=early=${earlyCount} noon=${noonCount} night=${nightCount}`);
+        }
+        if (offCount > 2) {
+          Logger.log(`[VIOLATION] date=${dateKey} type=daily_off_cap details=offCount=${offCount}`);
+        }
+      }
+
       for (const person of this.people) {
         const byDate = plan.get(person.empId);
         if (!byDate) continue;
@@ -585,6 +631,15 @@ class Scheduler {
           const curCode = byDate.get(curKey);
           if (!minRestOk_(prevKey, prevCode, curKey, curCode)) {
             Logger.log(`[VIOLATION] empId=${person.empId} type=min_rest details=prevDate=${prevKey} curDate=${curKey}`);
+          }
+        }
+
+        if (hasFixedNightRule && person.empId === FIXED_NIGHT_EMP_ID) {
+          for (const { dateKey } of days) {
+            const code = byDate.get(dateKey);
+            if (isWorkCode(code) && code !== "常夜") {
+              Logger.log(`[VIOLATION] empId=${person.empId} type=fixed_night details=date=${dateKey} code=${code}`);
+            }
           }
         }
       }
