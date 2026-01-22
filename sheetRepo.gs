@@ -83,6 +83,42 @@ class SheetRepo {
     if (matrix.length) sh.getRange(1 + headerRows.length, 1, matrix.length, headerRows[0].length).setValues(matrix);
   }
 
+  writeLastSchedule(matrix, headers){
+    const sh = this.ss.getSheetByName("LAST") || this.ss.insertSheet("LAST");
+    sh.clearContents();
+    const headerRows = Array.isArray(headers[0]) ? headers : [headers];
+    sh.getRange(1, 1, headerRows.length, headerRows[0].length).setValues(headerRows);
+    if (matrix.length) sh.getRange(1 + headerRows.length, 1, matrix.length, headerRows[0].length).setValues(matrix);
+  }
+
+  getLastSchedule(windowStartDate, windowEndDate){
+    const sh = this.ss.getSheetByName("LAST");
+    const seedMatrix = new Map();
+    if (!sh) return seedMatrix;
+    const values = sh.getDataRange().getValues();
+    if (values.length < 3) return seedMatrix;
+    const windowStart = new Date(windowStartDate);
+    const windowEnd = new Date(windowEndDate);
+    const maxCols = 2 + Math.round((windowEnd.getTime() - windowStart.getTime()) / 86400000) + 1;
+    for (let rowIdx = 2; rowIdx < values.length; rowIdx += 1) {
+      const row = values[rowIdx];
+      const empId = String(row[0] || "").trim();
+      if (!empId) continue;
+      if (!seedMatrix.has(empId)) seedMatrix.set(empId, new Map());
+      const byDate = seedMatrix.get(empId);
+      for (let colIdx = 2; colIdx < row.length && colIdx < maxCols; colIdx += 1) {
+        const offset = colIdx - 2;
+        const date = new Date(windowStart);
+        date.setDate(date.getDate() + offset);
+        if (date < windowStart || date > windowEnd) continue;
+        const code = row[colIdx];
+        if (code === "" || code === null) continue;
+        byDate.set(Utilities.formatDate(date, "Asia/Taipei", "yyyy-MM-dd"), code);
+      }
+    }
+    return seedMatrix;
+  }
+
   getExistingSchedule(windowStartDate, windowEndDate){
     const windowStart = new Date(windowStartDate);
     const windowEnd = new Date(windowEndDate);
