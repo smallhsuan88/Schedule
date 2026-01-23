@@ -165,12 +165,13 @@ class Scheduler {
       NIGHT: "N",
       LONG_NIGHT: "LN",
       OFF: "OFF",
-      REST_SUN: "R",
+      REST_SUN: "R_sun",
       REST_GENERAL: "r"
     });
 
     const CELL_STATUS = Object.freeze({
       EMPTY: "EMPTY",
+      ASSIGNED: "ASSIGNED",
       LOCKED_LEAVE: "LOCKED_LEAVE",
       LOCKED_SEED: "LOCKED_SEED",
       LOCKED_OFF: "LOCKED_OFF",
@@ -221,6 +222,26 @@ class Scheduler {
       longNight: shiftByCode.has("常夜L") ? "常夜L" : "常夜"
     };
 
+    const allowedShiftCodes = new Set([
+      SHIFT_TYPES.REST_SUN,
+      SHIFT_TYPES.REST_GENERAL,
+      ...shiftByCode.keys()
+    ]);
+    if (shiftByCode.has("特") || leaveTypes.has("特")) allowedShiftCodes.add("特");
+    if (shiftByCode.has("補") || leaveTypes.has("補")) allowedShiftCodes.add("補");
+
+    const normalizeShiftCode = raw => {
+      if (raw === null || raw === undefined) return "";
+      const rawStr = String(raw).trim();
+      if (!rawStr) return "";
+      if (rawStr.includes("+")) return "INVALID_MULTI_SHIFT";
+      const tokens = rawStr.split(/\s+/).filter(Boolean);
+      if (tokens.length > 1) return "INVALID_MULTI_SHIFT";
+      const code = tokens[0];
+      if (!allowedShiftCodes.has(code)) return "INVALID_SHIFT";
+      return code;
+    };
+
 
     const normalizeSeedCode = (dateKey, code) => {
       if (!code) return "";
@@ -240,11 +261,11 @@ class Scheduler {
       if (code === coverageShiftCodes.early || code === coverageShiftCodes.noon || code === coverageShiftCodes.night || code === coverageShiftCodes.longNight) {
         return false;
       }
-      return leaveTypes.has(code) || !shiftByCode.has(code);
+      return allowedShiftCodes.has(code) && !shiftByCode.has(code);
     };
     const isOffCode = code => code === SHIFT_TYPES.REST_SUN || code === SHIFT_TYPES.REST_GENERAL || isLeaveCode_(code);
     const isWorkCode = code => Boolean(code) && !isOffCode(code);
-    const isNightCode_ = code => code === "夜" || code === "夜L" || String(code || "").includes("常夜");
+    const isNightCode_ = code => code === coverageShiftCodes.night || code === coverageShiftCodes.longNight || String(code || "").includes("常夜");
     const isEarlyCode_ = code => code === "早" || code === "早L";
     const isNoonCode_ = code => code === "午" || code === "午L";
 
@@ -254,7 +275,7 @@ class Scheduler {
       const byDate = new Map();
       const statusByDate = new Map();
       for (const { dateKey } of windowDays) {
-        byDate.set(dateKey, []);
+        byDate.set(dateKey, "");
         statusByDate.set(dateKey, CELL_STATUS.EMPTY);
       }
       plan.set(person.empId, byDate);
@@ -331,26 +352,20 @@ class Scheduler {
       }
     }
 
-    const getCellCodes = (empId, dateKey) => plan.get(empId).get(dateKey) || [];
+    const getCellCode = (empId, dateKey) => plan.get(empId).get(dateKey) || "";
     const getCellStatus = (empId, dateKey) => statusPlan.get(empId).get(dateKey);
-    const setCell = (empId, dateKey, codes, status) => {
-      plan.get(empId).set(dateKey, codes);
+    const setCell = (empId, dateKey, code, status) => {
+      plan.get(empId).set(dateKey, code);
       if (status) statusPlan.get(empId).set(dateKey, status);
     };
 
-    const hasOffCode = codes => codes.some(code => isOffCode(code));
-    const hasWorkCode = codes => codes.some(code => isWorkCode(code));
+    const hasOffCode = code => isOffCode(code);
+    const hasWorkCode = code => isWorkCode(code);
     const isEarlyOrNoon = code => code === coverageShiftCodes.early || code === coverageShiftCodes.noon;
 
-    const getWorkWindow = (dateKey, codes) => {
-      const windows = codes
-        .map(code => getShiftStartEnd(dateKey, code))
-        .filter(Boolean);
-      if (!windows.length) return null;
-      const start = new Date(Math.min(...windows.map(item => item.start.getTime())));
-      const end = new Date(Math.max(...windows.map(item => item.end.getTime())));
-      const minRestHours = Math.max(...windows.map(item => item.minRestHours || 11));
-      return { start, end, minRestHours };
+    const getWorkWindow = (dateKey, code) => {
+      if (!code || !shiftByCode.has(code)) return null;
+      return getShiftStartEnd(dateKey, code);
     };
 
     const minRestOk = (empId, idx, candidateShiftCode) => {
@@ -358,14 +373,14 @@ class Scheduler {
       const byDate = plan.get(empId);
       if (!byDate) return false;
       const dateKey = dateKeys[idx];
-      const existingCodes = byDate.get(dateKey) || [];
-      const candidateCodes = existingCodes.concat(candidateShiftCode);
-      const candidateWindow = getWorkWindow(dateKey, candidateCodes);
+      const existingCode = byDate.get(dateKey);
+      if (existingCode) return false;
+      const candidateWindow = getWorkWindow(dateKey, candidateShiftCode);
       if (!candidateWindow) return false;
       const prevIdx = idx - 1;
       if (prevIdx >= 0) {
-        const prevCodes = byDate.get(dateKeys[prevIdx]) || [];
-        const prevWindow = getWorkWindow(dateKeys[prevIdx], prevCodes);
+        const prevCode = byDate.get(dateKeys[prevIdx]);
+        const prevWindow = getWorkWindow(dateKeys[prevIdx], prevCode);
         if (prevWindow) {
           const hours = (candidateWindow.start.getTime() - prevWindow.end.getTime()) / 36e5;
           if (hours < candidateWindow.minRestHours) return false;
@@ -373,8 +388,8 @@ class Scheduler {
       }
       const nextIdx = idx + 1;
       if (nextIdx < windowDays.length) {
-        const nextCodes = byDate.get(dateKeys[nextIdx]) || [];
-        const nextWindow = getWorkWindow(dateKeys[nextIdx], nextCodes);
+        const nextCode = byDate.get(dateKeys[nextIdx]);
+        const nextWindow = getWorkWindow(dateKeys[nextIdx], nextCode);
         if (nextWindow) {
           const hours = (nextWindow.start.getTime() - candidateWindow.end.getTime()) / 36e5;
           if (hours < candidateWindow.minRestHours) return false;
@@ -385,15 +400,14 @@ class Scheduler {
 
     const canAssign = (empId, idx, shiftCode) => {
       const dateKey = dateKeys[idx];
-      const codes = getCellCodes(empId, dateKey);
+      const code = getCellCode(empId, dateKey);
       const status = getCellStatus(empId, dateKey);
       if (status !== CELL_STATUS.EMPTY) return false;
-      if (hasOffCode(codes)) return false;
+      if (code) return false;
+      if (hasOffCode(code)) return false;
       if (!shiftByCode.has(shiftCode)) return false;
-      if (codes.includes(shiftCode)) return false;
       if (shiftCode === coverageShiftCodes.longNight && !fixedNightEmpSet.has(empId)) return false;
-      if (codes.length > 0 && !codes.every(isEarlyOrNoon)) return false;
-      if (codes.length > 0 && !isEarlyOrNoon(shiftCode)) return false;
+      if (shiftCode === coverageShiftCodes.night && (dailyLongNightCount.get(dateKey) || 0) >= 1) return false;
       if (!minRestOk(empId, idx, shiftCode)) return false;
       return true;
     };
@@ -402,18 +416,64 @@ class Scheduler {
       const dateKey = dateKeys[idx];
       const status = getCellStatus(empId, dateKey);
       if (status !== CELL_STATUS.EMPTY) return false;
-      const codes = getCellCodes(empId, dateKey);
-      if (hasWorkCode(codes)) return false;
-      if (hasOffCode(codes)) return false;
+      const code = getCellCode(empId, dateKey);
+      if (hasWorkCode(code)) return false;
+      if (hasOffCode(code)) return false;
       return true;
     };
 
     const countOffInRange = (empId, startIdx, endIdx) => {
       let count = 0;
       for (let idx = startIdx; idx <= endIdx; idx += 1) {
-        if (hasOffCode(getCellCodes(empId, dateKeys[idx]))) count += 1;
+        if (hasOffCode(getCellCode(empId, dateKeys[idx]))) count += 1;
       }
       return count;
+    };
+
+    const dailyOffCount = new Map(windowDays.map(item => [item.dateKey, 0]));
+
+    const updateOffCount = dateKey => {
+      let offCount = 0;
+      for (const person of this.people) {
+        const code = getCellCode(person.empId, dateKey);
+        if (hasOffCode(code)) offCount += 1;
+      }
+      dailyOffCount.set(dateKey, offCount);
+    };
+
+    const dailyLongNightCount = new Map(windowDays.map(item => [item.dateKey, 0]));
+
+    const tryAssign = (empId, dateKey, code, status, reason) => {
+      const normalized = normalizeShiftCode(code);
+      if (normalized === "INVALID_MULTI_SHIFT" || normalized === "INVALID_SHIFT") {
+        logViolation({ type: "invalid_shift_code", empId, date: dateKey, code, reason });
+        return false;
+      }
+      if (!normalized) return false;
+      const existing = getCellCode(empId, dateKey);
+      const existingStatus = getCellStatus(empId, dateKey);
+      if (existing || existingStatus !== CELL_STATUS.EMPTY) {
+        logWarn({ type: "cell_locked", empId, date: dateKey, code: normalized, reason });
+        return false;
+      }
+      if (normalized === coverageShiftCodes.night && (dailyLongNightCount.get(dateKey) || 0) >= 1) {
+        logViolation({ type: "night_mutex", empId, date: dateKey, code: normalized, reason });
+        return false;
+      }
+      setCell(empId, dateKey, normalized, status || CELL_STATUS.ASSIGNED);
+      if (normalized === coverageShiftCodes.longNight) {
+        dailyLongNightCount.set(dateKey, (dailyLongNightCount.get(dateKey) || 0) + 1);
+      }
+      if (hasOffCode(normalized)) {
+        updateOffCount(dateKey);
+      }
+      return true;
+    };
+
+    const assignOff = (empId, idx, code, status, reason) => {
+      if (!canAssignOff(empId, idx)) return false;
+      const dateKey = dateKeys[idx];
+      return tryAssign(empId, dateKey, code, status, reason);
     };
 
     // Phase 0: seed existing schedule for the entire 35-day window
@@ -421,46 +481,32 @@ class Scheduler {
     if (seedMatrix) {
       for (const [empId, byDateSeed] of seedMatrix.entries()) {
         const byDate = plan.get(empId);
-        const statusByDate = statusPlan.get(empId);
         if (!byDate) continue;
         for (const [dateKey, rawCode] of byDateSeed.entries()) {
           if (!byDate.has(dateKey)) continue;
-          if (byDate.get(dateKey).length > 0) continue;
-          const code = normalizeSeedCode(dateKey, rawCode);
-          if (!code) continue;
-          byDate.set(dateKey, [code]);
-          statusByDate.set(dateKey, CELL_STATUS.LOCKED_SEED);
+          const normalized = normalizeSeedCode(dateKey, rawCode);
+          if (!normalized) continue;
+          const result = normalizeShiftCode(normalized);
+          if (result === "INVALID_MULTI_SHIFT" || result === "INVALID_SHIFT") {
+            logViolation({ type: "invalid_shift_code", empId, date: dateKey, code: rawCode, source: "seedMatrix" });
+            continue;
+          }
+          tryAssign(empId, dateKey, normalized, CELL_STATUS.LOCKED_SEED, "seedMatrix");
         }
       }
     }
-
-    const dailyOffCount = new Map(windowDays.map(item => [item.dateKey, 0]));
-
-    const updateOffCount = dateKey => {
-      let offCount = 0;
-      for (const person of this.people) {
-        const codes = getCellCodes(person.empId, dateKey);
-        if (hasOffCode(codes)) offCount += 1;
-      }
-      dailyOffCount.set(dateKey, offCount);
-    };
-
-    const assignOff = (empId, idx, code, status) => {
-      if (!canAssignOff(empId, idx)) return false;
-      const dateKey = dateKeys[idx];
-      setCell(empId, dateKey, [code], status);
-      updateOffCount(dateKey);
-      return true;
-    };
 
     // Phase A: Leave (fixed off)
     for (const item of this.leave) {
       const dateKey = fmtDate(item.date);
       const byDate = plan.get(item.empId);
-      if (byDate && byDate.has(dateKey)) {
-        setCell(item.empId, dateKey, [item.leaveType], CELL_STATUS.LOCKED_LEAVE);
-        updateOffCount(dateKey);
+      if (!byDate || !byDate.has(dateKey)) continue;
+      const normalized = normalizeShiftCode(item.leaveType);
+      if (normalized === "INVALID_MULTI_SHIFT" || normalized === "INVALID_SHIFT") {
+        logViolation({ type: "invalid_shift_code", empId: item.empId, date: dateKey, code: item.leaveType, source: "leave" });
+        continue;
       }
+      tryAssign(item.empId, dateKey, normalized, CELL_STATUS.LOCKED_LEAVE, "leave");
     }
 
     // Phase B: seed from LAST and tally quota
@@ -469,9 +515,25 @@ class Scheduler {
       const byDate = plan.get(person.empId);
       if (!byDate) continue;
       for (const { dateKey } of windowDays) {
-        const codes = byDate.get(dateKey);
-        if (codes.includes(SHIFT_TYPES.REST_SUN)) quotaCountByEmp.get(person.empId).R += 1;
-        if (codes.includes(SHIFT_TYPES.REST_GENERAL)) quotaCountByEmp.get(person.empId).r += 1;
+        const code = byDate.get(dateKey);
+        if (code === SHIFT_TYPES.REST_SUN) quotaCountByEmp.get(person.empId).R += 1;
+        if (code === SHIFT_TYPES.REST_GENERAL) quotaCountByEmp.get(person.empId).r += 1;
+      }
+    }
+    const quotaRemainingByEmp = new Map();
+    for (const person of this.people) {
+      const used = quotaCountByEmp.get(person.empId) || { R: 0, r: 0 };
+      const remaining = {
+        R: Math.max(0, 5 - used.R),
+        r: Math.max(0, 5 - used.r)
+      };
+      quotaRemainingByEmp.set(person.empId, remaining);
+      if (used.R > 5 || used.r > 5) {
+        logViolation({
+          type: "quota_exceeded_seeded",
+          empId: person.empId,
+          details: `R_sun=${used.R} r=${used.r}`
+        });
       }
     }
 
@@ -496,10 +558,11 @@ class Scheduler {
         if (idx === undefined) continue;
         if (hasOffCode(byDate.get(dateKey))) continue;
         if (String(shiftCode || "").includes("常夜")) continue;
-        if (byDate.get(dateKey).length > 0) continue;
+        if (byDate.get(dateKey)) continue;
         if (canAssign(person.empId, idx, shiftCode)) {
-          byDate.set(dateKey, [shiftCode]);
-          statusPlan.get(person.empId).set(dateKey, CELL_STATUS.LOCKED_SEED);
+          if (!tryAssign(person.empId, dateKey, shiftCode, CELL_STATUS.LOCKED_SEED, "fixed_shift")) {
+            logWarn({ type: "fixed_shift_unassigned", empId: person.empId, date: dateKey, shiftCode });
+          }
         } else {
           logWarn({ type: "fixed_shift_unassigned", empId: person.empId, date: dateKey, shiftCode });
         }
@@ -520,13 +583,20 @@ class Scheduler {
     const ensureWeeklyOff = () => {
       for (const person of this.people) {
         for (const bucket of weekBucketsIdx) {
-          const hasOff = bucket.some(idx => hasOffCode(getCellCodes(person.empId, dateKeys[idx])));
+          const hasOff = bucket.some(idx => hasOffCode(getCellCode(person.empId, dateKeys[idx])));
           if (hasOff) continue;
           const sorted = bucket.slice().sort((a, b) => (dailyOffCount.get(dateKeys[a]) || 0) - (dailyOffCount.get(dateKeys[b]) || 0));
           let placed = false;
+          if ((quotaRemainingByEmp.get(person.empId) || {}).r <= 0) {
+            logWarn({ type: "quota_exhausted", empId: person.empId, quotaType: "r", weekStart: dateKeys[bucket[0]] });
+            continue;
+          }
           for (const idx of sorted) {
-            if (assignOff(person.empId, idx, SHIFT_TYPES.REST_GENERAL, CELL_STATUS.LOCKED_OFF)) {
+            if ((quotaRemainingByEmp.get(person.empId) || {}).r <= 0) break;
+            if (assignOff(person.empId, idx, SHIFT_TYPES.REST_GENERAL, CELL_STATUS.LOCKED_OFF, "weekly_off")) {
               placed = true;
+              quotaRemainingByEmp.get(person.empId).r -= 1;
+              quotaCountByEmp.get(person.empId).r += 1;
               break;
             }
           }
@@ -538,7 +608,7 @@ class Scheduler {
     };
 
     const assignQuotaOff = (person, type, targets) => {
-      const remaining = targets - quotaCountByEmp.get(person.empId)[type];
+      const remaining = (quotaRemainingByEmp.get(person.empId) || {})[type];
       if (remaining <= 0) return;
       const candidateIdx = type === "R"
         ? sundayIdx.slice()
@@ -548,8 +618,10 @@ class Scheduler {
       for (const idx of candidateIdx) {
         if (toAssign <= 0) break;
         if (type === "R" && dow[idx] !== 0) continue;
-        if (assignOff(person.empId, idx, type === "R" ? SHIFT_TYPES.REST_SUN : SHIFT_TYPES.REST_GENERAL, CELL_STATUS.LOCKED_OFF)) {
+        const code = type === "R" ? SHIFT_TYPES.REST_SUN : SHIFT_TYPES.REST_GENERAL;
+        if (assignOff(person.empId, idx, code, CELL_STATUS.LOCKED_OFF, "quota_off")) {
           quotaCountByEmp.get(person.empId)[type] += 1;
+          quotaRemainingByEmp.get(person.empId)[type] -= 1;
           toAssign -= 1;
           const maxOff = dailyOffCap.get(dateKeys[idx]) || 0;
           const offCount = dailyOffCount.get(dateKeys[idx]) || 0;
@@ -577,7 +649,7 @@ class Scheduler {
       for (let idx = 0; idx < windowDays.length; idx += 1) {
         const dateKey = dateKeys[idx];
         if (!canAssign(empId, idx, coverageShiftCodes.longNight)) continue;
-        setCell(empId, dateKey, [coverageShiftCodes.longNight], CELL_STATUS.LOCKED_LN);
+        tryAssign(empId, dateKey, coverageShiftCodes.longNight, CELL_STATUS.LOCKED_LN, "long_night");
       }
     }
 
@@ -587,6 +659,7 @@ class Scheduler {
     const pickCandidate = (idx, shiftCode, options = {}) => {
       const candidates = [];
       for (const person of this.people) {
+        if (options.candidates && !options.candidates.has(person.empId)) continue;
         if (options.exclude && options.exclude.has(person.empId)) continue;
         if (!canAssign(person.empId, idx, shiftCode)) continue;
         candidates.push(person.empId);
@@ -612,27 +685,24 @@ class Scheduler {
       return candidates[0] || null;
     };
 
-    const markAssigned = (empId, idx, shiftCode) => {
+    const markAssigned = (empId, idx, shiftCode, status, reason) => {
       const dateKey = dateKeys[idx];
-      const codes = getCellCodes(empId, dateKey);
-      if (!codes.includes(shiftCode)) {
-        codes.push(shiftCode);
-        plan.get(empId).set(dateKey, codes);
-      }
+      if (!tryAssign(empId, dateKey, shiftCode, status || CELL_STATUS.ASSIGNED, reason)) return false;
       assignedCount.set(empId, (assignedCount.get(empId) || 0) + 1);
       if (shiftCode === coverageShiftCodes.night || shiftCode === coverageShiftCodes.longNight) {
         nightCount.set(empId, (nightCount.get(empId) || 0) + 1);
       }
+      return true;
     };
 
     for (const person of this.people) {
       const byDate = plan.get(person.empId);
       if (!byDate) continue;
       for (const { dateKey } of windowDays) {
-        const codes = byDate.get(dateKey);
-        if (!hasWorkCode(codes)) continue;
-        assignedCount.set(person.empId, (assignedCount.get(person.empId) || 0) + codes.length);
-        if (codes.some(code => isNightCode_(code))) {
+        const code = byDate.get(dateKey);
+        if (!hasWorkCode(code)) continue;
+        assignedCount.set(person.empId, (assignedCount.get(person.empId) || 0) + 1);
+        if (isNightCode_(code)) {
           nightCount.set(person.empId, (nightCount.get(person.empId) || 0) + 1);
         }
       }
@@ -640,12 +710,8 @@ class Scheduler {
 
     const dailyNightTaken = new Map(windowDays.map(item => [item.dateKey, false]));
     for (const { dateKey } of windowDays) {
-      for (const person of this.people) {
-        const codes = plan.get(person.empId).get(dateKey);
-        if (codes.includes(coverageShiftCodes.longNight)) {
-          dailyNightTaken.set(dateKey, true);
-          break;
-        }
+      if ((dailyLongNightCount.get(dateKey) || 0) >= 1) {
+        dailyNightTaken.set(dateKey, true);
       }
     }
 
@@ -658,9 +724,9 @@ class Scheduler {
       for (let count = 0; count < needNTotal; count += 1) {
         const candidate = pickCandidate(idx, coverageShiftCodes.night, { exclude: fixedNightEmpSet });
         if (candidate) {
-          markAssigned(candidate, idx, coverageShiftCodes.night);
-          statusPlan.get(candidate).set(dateKey, CELL_STATUS.LOCKED_N);
-          dailyNightTaken.set(dateKey, true);
+          if (markAssigned(candidate, idx, coverageShiftCodes.night, CELL_STATUS.LOCKED_N, "night_fill")) {
+            dailyNightTaken.set(dateKey, true);
+          }
         } else {
           logWarn({ type: "no_feasible_night", date: dateKey, reason: "minRest/leave/offCap" });
           break;
@@ -672,17 +738,25 @@ class Scheduler {
     for (let idx = 0; idx < windowDays.length; idx += 1) {
       const dateKey = dateKeys[idx];
       const demand = getDailyDemand(dateKey);
+      const availableForDay = new Set();
+      for (const person of this.people) {
+        if (canAssign(person.empId, idx, coverageShiftCodes.early) || canAssign(person.empId, idx, coverageShiftCodes.noon)) {
+          availableForDay.add(person.empId);
+        }
+      }
 
       if (shiftByCode.has(coverageShiftCodes.early)) {
         let currentEarly = 0;
         for (const person of this.people) {
-          const codes = plan.get(person.empId).get(dateKey);
-          if (codes.includes(coverageShiftCodes.early)) currentEarly += 1;
+          const code = plan.get(person.empId).get(dateKey);
+          if (code === coverageShiftCodes.early) currentEarly += 1;
         }
         for (let count = currentEarly; count < demand.early; count += 1) {
-          const candidate = pickCandidate(idx, coverageShiftCodes.early);
+          const candidate = pickCandidate(idx, coverageShiftCodes.early, { candidates: availableForDay });
           if (candidate) {
-            markAssigned(candidate, idx, coverageShiftCodes.early);
+            if (markAssigned(candidate, idx, coverageShiftCodes.early, CELL_STATUS.ASSIGNED, "early_fill")) {
+              availableForDay.delete(candidate);
+            }
           } else {
             logWarn({ type: "no_feasible_early", date: dateKey, reason: "minRest/leave/offCap" });
             break;
@@ -693,13 +767,15 @@ class Scheduler {
       if (shiftByCode.has(coverageShiftCodes.noon)) {
         let currentNoon = 0;
         for (const person of this.people) {
-          const codes = plan.get(person.empId).get(dateKey);
-          if (codes.includes(coverageShiftCodes.noon)) currentNoon += 1;
+          const code = plan.get(person.empId).get(dateKey);
+          if (code === coverageShiftCodes.noon) currentNoon += 1;
         }
         for (let count = currentNoon; count < demand.noon; count += 1) {
-          const candidate = pickCandidate(idx, coverageShiftCodes.noon);
+          const candidate = pickCandidate(idx, coverageShiftCodes.noon, { candidates: availableForDay });
           if (candidate) {
-            markAssigned(candidate, idx, coverageShiftCodes.noon);
+            if (markAssigned(candidate, idx, coverageShiftCodes.noon, CELL_STATUS.ASSIGNED, "noon_fill")) {
+              availableForDay.delete(candidate);
+            }
           } else {
             logWarn({ type: "no_feasible_noon", date: dateKey, reason: "minRest/leave/offCap" });
             break;
@@ -720,12 +796,12 @@ class Scheduler {
         let longNightCount = 0;
         let offCount = 0;
         for (const person of this.people) {
-          const codes = plan.get(person.empId).get(dateKey);
-          if (hasOffCode(codes)) offCount += 1;
-          if (codes.includes(coverageShiftCodes.early)) earlyCount += 1;
-          if (codes.includes(coverageShiftCodes.noon)) noonCount += 1;
-          if (codes.includes(coverageShiftCodes.night)) nightCount += 1;
-          if (codes.includes(coverageShiftCodes.longNight)) longNightCount += 1;
+          const code = plan.get(person.empId).get(dateKey);
+          if (hasOffCode(code)) offCount += 1;
+          if (code === coverageShiftCodes.early) earlyCount += 1;
+          if (code === coverageShiftCodes.noon) noonCount += 1;
+          if (code === coverageShiftCodes.night) nightCount += 1;
+          if (code === coverageShiftCodes.longNight) longNightCount += 1;
         }
         const nightCoverage = nightCount + longNightCount;
         const availableCount = this.people.length - offCount;
@@ -753,14 +829,14 @@ class Scheduler {
         const byDate = plan.get(person.empId);
         if (!byDate) continue;
         const quota = quotaByEmp.get(person.empId) || { quotaSun: 5, quotaOffTotal: 10 };
-        const sunCount = sundayIdx.reduce((sum, idx) => sum + (byDate.get(dateKeys[idx]).includes(SHIFT_TYPES.REST_SUN) ? 1 : 0), 0);
+        const sunCount = sundayIdx.reduce((sum, idx) => sum + (byDate.get(dateKeys[idx]) === SHIFT_TYPES.REST_SUN ? 1 : 0), 0);
         const offTotal = windowDays.reduce((sum, { dateKey }) => sum + (hasOffCode(byDate.get(dateKey)) ? 1 : 0), 0);
-        const rCount = windowDays.reduce((sum, { dateKey }) => sum + (byDate.get(dateKey).includes(SHIFT_TYPES.REST_GENERAL) ? 1 : 0), 0);
-        if (sunCount !== quota.quotaSun) {
-          logViolation({ empId: person.empId, type: "quota_sun", details: `target=${quota.quotaSun} actual=${sunCount}` });
+        const rCount = windowDays.reduce((sum, { dateKey }) => sum + (byDate.get(dateKey) === SHIFT_TYPES.REST_GENERAL ? 1 : 0), 0);
+        if (sunCount > 5) {
+          logViolation({ empId: person.empId, type: "quota_sun", details: `limit=5 actual=${sunCount}` });
         }
-        if (rCount !== 5) {
-          logViolation({ empId: person.empId, type: "quota_r", details: `target=5 actual=${rCount}` });
+        if (rCount > 5) {
+          logViolation({ empId: person.empId, type: "quota_r", details: `limit=5 actual=${rCount}` });
         }
         if (offTotal < quota.quotaOffTotal) {
           logViolation({ empId: person.empId, type: "quota_off_total", details: `target=${quota.quotaOffTotal} actual=${offTotal}` });
@@ -776,11 +852,11 @@ class Scheduler {
         for (let idx = 1; idx < windowDays.length; idx += 1) {
           const prevKey = dateKeys[idx - 1];
           const curKey = dateKeys[idx];
-          const prevCodes = byDate.get(prevKey);
-          const curCodes = byDate.get(curKey);
-          if (hasWorkCode(prevCodes) && hasWorkCode(curCodes)) {
-            const prevShift = getWorkWindow(prevKey, prevCodes);
-            const curShift = getWorkWindow(curKey, curCodes);
+          const prevCode = byDate.get(prevKey);
+          const curCode = byDate.get(curKey);
+          if (hasWorkCode(prevCode) && hasWorkCode(curCode)) {
+            const prevShift = getWorkWindow(prevKey, prevCode);
+            const curShift = getWorkWindow(curKey, curCode);
             if (!prevShift || !curShift) {
               logViolation({ empId: person.empId, type: "min_rest", details: `prevDate=${prevKey} curDate=${curKey}` });
             } else {
@@ -794,9 +870,9 @@ class Scheduler {
 
         if (fixedNightEmpSet.has(person.empId)) {
           for (const { dateKey } of windowDays) {
-            const codes = byDate.get(dateKey);
-            if (hasWorkCode(codes) && !codes.includes(coverageShiftCodes.longNight)) {
-              logViolation({ empId: person.empId, type: "fixed_night", details: `date=${dateKey} code=${codes.join("+")}` });
+            const code = byDate.get(dateKey);
+            if (hasWorkCode(code) && code !== coverageShiftCodes.longNight) {
+              logViolation({ empId: person.empId, type: "fixed_night", details: `date=${dateKey} code=${code}` });
             }
           }
         }
@@ -804,7 +880,52 @@ class Scheduler {
       return { ok: violations.length === 0, warnings, coverage };
     };
 
+    const validateFinal = () => {
+      let ok = true;
+      for (const person of this.people) {
+        const byDate = plan.get(person.empId);
+        if (!byDate) continue;
+        let sunCount = 0;
+        let rCount = 0;
+        for (const { dateKey } of windowDays) {
+          const code = byDate.get(dateKey);
+          if (!code) continue;
+          const normalized = normalizeShiftCode(code);
+          if (normalized === "INVALID_MULTI_SHIFT" || normalized === "INVALID_SHIFT") {
+            logViolation({ type: "invalid_shift_code", empId: person.empId, date: dateKey, code });
+            ok = false;
+          }
+          if (code === SHIFT_TYPES.REST_SUN) sunCount += 1;
+          if (code === SHIFT_TYPES.REST_GENERAL) rCount += 1;
+        }
+        if (sunCount > 5) {
+          logViolation({ empId: person.empId, type: "quota_sun", details: `limit=5 actual=${sunCount}` });
+          ok = false;
+        }
+        if (rCount > 5) {
+          logViolation({ empId: person.empId, type: "quota_r", details: `limit=5 actual=${rCount}` });
+          ok = false;
+        }
+      }
+
+      for (const { dateKey } of windowDays) {
+        let longNightCount = 0;
+        let nightCount = 0;
+        for (const person of this.people) {
+          const code = plan.get(person.empId).get(dateKey);
+          if (code === coverageShiftCodes.longNight) longNightCount += 1;
+          if (code === coverageShiftCodes.night) nightCount += 1;
+        }
+        if (longNightCount >= 1 && nightCount > 0) {
+          logViolation({ date: dateKey, type: "night_mutual_exclusion", details: `LN=${longNightCount} N=${nightCount}` });
+          ok = false;
+        }
+      }
+      return ok;
+    };
+
     const validation = validatePlanDetailed();
+    const finalOk = validateFinal();
     for (const violation of violations) {
       Logger.log(`[VIOLATION] ${JSON.stringify(violation)}`);
     }
@@ -814,6 +935,9 @@ class Scheduler {
     Logger.log(`[SUMMARY] window=${dateKeys[0]}~${dateKeys[dateKeys.length - 1]}`);
     for (const entry of validation.coverage || []) {
       Logger.log(`[SUMMARY] date=${entry.date} early=${entry.earlyCount} noon=${entry.noonCount} nightCoverage=${entry.nightCoverage} offCount=${entry.offCount}`);
+    }
+    if (!finalOk) {
+      Logger.log("[SUMMARY] final_validation=FAILED");
     }
 
     this.monthPlan = { month, days, windowDays, plan };
@@ -829,8 +953,8 @@ class Scheduler {
       const byDate = this.monthPlan.plan.get(person.empId);
       const row = [person.empId, person.name];
       for (const { dateKey } of this.monthPlan.days) {
-        const codes = byDate ? byDate.get(dateKey) || [] : [];
-        row.push(codes.length ? codes.join("+") : "");
+        const code = byDate ? byDate.get(dateKey) || "" : "";
+        row.push(code || "");
       }
       return row;
     });
@@ -846,8 +970,8 @@ class Scheduler {
       const byDate = this.monthPlan.plan.get(person.empId);
       const row = [person.empId, person.name];
       for (const { dateKey } of this.monthPlan.windowDays) {
-        const codes = byDate ? byDate.get(dateKey) || [] : [];
-        row.push(codes.length ? codes.join("+") : "");
+        const code = byDate ? byDate.get(dateKey) || "" : "";
+        row.push(code || "");
       }
       return row;
     });
