@@ -17,9 +17,15 @@ function runGenerateSchedule() {
   windowStartDate.setDate(windowStartDate.getDate() - windowStartDate.getDay());
   const windowEndDate = new Date(windowStartDate);
   windowEndDate.setDate(windowEndDate.getDate() + 34);
-  const seedMatrix = repo.getLastSchedule(windowStartDate, windowEndDate);
+  const historyStartDate = new Date(monthStartDate);
+  historyStartDate.setDate(historyStartDate.getDate() - 6);
+  const seedMatrix = repo.getLastSchedule(historyStartDate, windowEndDate);
   const existingMatrix = repo.getExistingSchedule(windowStartDate, windowEndDate);
-  scheduler.buildMonthPlan(monthStr, { seedMatrix, existingMatrix });
+  const result = scheduler.buildMonthPlan(monthStr, { seedMatrix, existingMatrix });
+  if (!result.ok) {
+    Logger.log("[SUMMARY] final_validation=FAILED - MonthSchedule not updated.");
+    return;
+  }
   const { headers, matrix } = scheduler.toMonthMatrix();
 
   repo.writeMonthSchedule(matrix, headers);
