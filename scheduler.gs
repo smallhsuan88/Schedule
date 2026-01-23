@@ -167,6 +167,10 @@ class Scheduler {
       REST_WEEKLY: "R",
       REST_GENERAL: "r"
     });
+    const softPreference = {
+      changePenalty: Number(options.changePenalty ?? 3),
+      sameShiftBonus: Number(options.sameShiftBonus ?? 2)
+    };
 
     const CELL_STATUS = Object.freeze({
       EMPTY: "EMPTY",
@@ -403,6 +407,16 @@ class Scheduler {
         if (hasOffCode(getCellCode(empId, dateKeys[idx]))) count += 1;
       }
       return count;
+    };
+
+    const getShiftChangeScore = (empId, idx, shiftCode) => {
+      if (!hasWorkCode(shiftCode)) return 0;
+      const prevIdx = idx - 1;
+      if (prevIdx < 0) return 0;
+      const prevCode = getCellCode(empId, dateKeys[prevIdx]);
+      if (!hasWorkCode(prevCode)) return 0;
+      if (prevCode === shiftCode) return -softPreference.sameShiftBonus;
+      return softPreference.changePenalty;
     };
 
     const hasSevenDayOffCoverage = (empId, idx) => {
@@ -688,6 +702,9 @@ class Scheduler {
         const bRecentOff = countOffInRange(b, rangeStart, idx) > 0;
         if (aRecentOff && !bRecentOff) return -1;
         if (bRecentOff && !aRecentOff) return 1;
+        const aShiftChange = getShiftChangeScore(a, idx, shiftCode);
+        const bShiftChange = getShiftChangeScore(b, idx, shiftCode);
+        if (aShiftChange !== bShiftChange) return aShiftChange - bShiftChange;
         const nightDiff = (nightCount.get(a) || 0) - (nightCount.get(b) || 0);
         if (nightDiff !== 0) return nightDiff;
         return (assignedCount.get(a) || 0) - (assignedCount.get(b) || 0);
