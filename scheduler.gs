@@ -151,11 +151,20 @@ class Scheduler {
       dt.setDate(dt.getDate() + i);
       windowDays.push({ date: dt, dateKey: fmtDate(dt) });
     }
+    const historyLength = 6;
+    const historyDays = [];
+    for (let i = historyLength; i > 0; i -= 1) {
+      const dt = new Date(windowStartDate);
+      dt.setDate(dt.getDate() - i);
+      historyDays.push({ date: dt, dateKey: fmtDate(dt) });
+    }
 
     // Phase 0: calendar structure (window-based)
     const calendarDates = windowDays.map(({ date }) => date);
     const dateKeys = windowDays.map(({ dateKey }) => dateKey);
     const dayIndex = new Map(windowDays.map((item, idx) => [item.dateKey, idx]));
+    const historyDateKeys = historyDays.map(({ dateKey }) => dateKey);
+    const historyDateKeySet = new Set(historyDateKeys);
 
     const shiftByCode = new Map(Object.values(this.shiftDefs).map(def => [def.shiftCode, def]));
 
@@ -163,9 +172,8 @@ class Scheduler {
       EARLY: "E",
       NOON: "M",
       NIGHT: "N",
-      LONG_NIGHT: "LN",
-      OFF: "OFF",
-      REST_WEEKLY: "R_sum",
+      LONG_NIGHT: "L",
+      REST_WEEKLY: "R_sun",
       REST_GENERAL: "r"
     });
     const softPreference = {
@@ -182,7 +190,6 @@ class Scheduler {
       LOCKED_LN: "LOCKED_LN",
       LOCKED_N: "LOCKED_N"
     });
-    const leaveTypes = new Set(this.leave.map(item => item.leaveType).filter(Boolean));
     const fixedRulesByEmp = new Map();
     for (const rule of this.fixedRules) {
       if (!fixedRulesByEmp.has(rule.empId)) fixedRulesByEmp.set(rule.empId, []);
@@ -220,23 +227,21 @@ class Scheduler {
     };
 
     const coverageShiftCodes = {
-      early: shiftByCode.has("早L") ? "早L" : "早",
-      noon: shiftByCode.has("午L") ? "午L" : "午",
-      night: shiftByCode.has("夜L") ? "夜L" : "夜",
-      longNight: shiftByCode.has("常夜L") ? "常夜L" : "常夜"
+      early: SHIFT_TYPES.EARLY,
+      noon: SHIFT_TYPES.NOON,
+      night: SHIFT_TYPES.NIGHT,
+      longNight: SHIFT_TYPES.LONG_NIGHT
     };
 
     const allowedShiftCodes = new Set([
+      SHIFT_TYPES.EARLY,
+      SHIFT_TYPES.NOON,
+      SHIFT_TYPES.NIGHT,
+      SHIFT_TYPES.LONG_NIGHT,
       SHIFT_TYPES.REST_WEEKLY,
-      SHIFT_TYPES.REST_GENERAL,
-      ...shiftByCode.keys()
+      SHIFT_TYPES.REST_GENERAL
     ]);
-    for (const leaveType of leaveTypes) {
-      if (leaveType) allowedShiftCodes.add(String(leaveType).normalize("NFKC").trim());
-    }
-    if (shiftByCode.has("特") || leaveTypes.has("特")) allowedShiftCodes.add("特");
-    if (shiftByCode.has("補") || leaveTypes.has("補")) allowedShiftCodes.add("補");
-    if (shiftByCode.has("師") || leaveTypes.has("師")) allowedShiftCodes.add("師");
+    allowedShiftCodes.add("Leave");
 
     const normalizeShiftCode = raw => {
       if (raw === null || raw === undefined) return "";
@@ -246,7 +251,7 @@ class Scheduler {
       const tokens = rawStr.split(/\s+/).filter(Boolean);
       if (tokens.length > 1) return "INVALID_MULTI_SHIFT";
       const code = tokens[0];
-      if (code === "R" || code === "R_sun" || code === "R_sum" || code === "R_sat") return SHIFT_TYPES.REST_WEEKLY;
+      if (code === "R" || code === "R_sun" || code === "R_sum") return SHIFT_TYPES.REST_WEEKLY;
       if (!allowedShiftCodes.has(code)) return "INVALID_SHIFT";
       return code;
     };
@@ -255,7 +260,7 @@ class Scheduler {
       if (!code) return "";
       const rawStr = String(code).normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
       if (!rawStr) return "";
-      if (rawStr === "R_sun" || rawStr === "R_sat" || rawStr === "R_sum") return SHIFT_TYPES.REST_WEEKLY;
+      if (rawStr === "R_sun" || rawStr === "R_sum") return SHIFT_TYPES.REST_WEEKLY;
       if (rawStr === "R") return SHIFT_TYPES.REST_WEEKLY;
       return rawStr;
     };
@@ -263,7 +268,10 @@ class Scheduler {
     const isLeaveCode_ = code => {
       if (!code) return false;
       if (code === SHIFT_TYPES.REST_WEEKLY || code === SHIFT_TYPES.REST_GENERAL) return false;
-      if (code === coverageShiftCodes.early || code === coverageShiftCodes.noon || code === coverageShiftCodes.night || code === coverageShiftCodes.longNight) {
+      if (code === coverageShiftCodes.early
+        || code === coverageShiftCodes.noon
+        || code === coverageShiftCodes.night
+        || code === coverageShiftCodes.longNight) {
         return false;
       }
       return allowedShiftCodes.has(code) && !shiftByCode.has(code);
@@ -271,11 +279,21 @@ class Scheduler {
     const isBreakOffCode = code => code === SHIFT_TYPES.REST_WEEKLY || code === SHIFT_TYPES.REST_GENERAL;
     const isOtherLeaveCode = code => isLeaveCode_(code);
     const isOffCode = code => isBreakOffCode(code) || isOtherLeaveCode(code);
-    const isWorkCode = code => Boolean(code) && !isOffCode(code);
-    const isWorkDayForStreak = code => !isOffCode(code);
-    const isNightCode_ = code => code === coverageShiftCodes.night || code === coverageShiftCodes.longNight || String(code || "").includes("常夜");
-    const isEarlyCode_ = code => code === "早" || code === "早L";
-    const isNoonCode_ = code => code === "午" || code === "午L";
+    const isWorkCode = code => code === SHIFT_TYPES.EARLY
+      || code === SHIFT_TYPES.NOON
+      || code === SHIFT_TYPES.NIGHT
+      || code === SHIFT_TYPES.LONG_NIGHT;
+    const isWorkDayForStreak = code => {
+      if (code === "" || code === null || code === undefined) return true;
+      return !isBreakOffCode(code);
+    };
+    const isWorkDayForStreakForAssign = code => {
+      if (code === "" || code === null || code === undefined) return false;
+      return !isBreakOffCode(code);
+    };
+    const isNightCode_ = code => code === SHIFT_TYPES.NIGHT || code === SHIFT_TYPES.LONG_NIGHT;
+    const isEarlyCode_ = code => code === SHIFT_TYPES.EARLY;
+    const isNoonCode_ = code => code === SHIFT_TYPES.NOON;
 
     const plan = new Map();
     const statusPlan = new Map();
@@ -289,6 +307,14 @@ class Scheduler {
       plan.set(person.empId, byDate);
       statusPlan.set(person.empId, statusByDate);
     }
+    const historyPlan = new Map();
+    for (const person of this.people) {
+      const historyByDate = new Map();
+      for (const { dateKey } of historyDays) {
+        historyByDate.set(dateKey, "");
+      }
+      historyPlan.set(person.empId, historyByDate);
+    }
 
     const weekBucketsIdx = [];
     for (let startIdx = 0; startIdx < windowDays.length; startIdx += 7) {
@@ -299,11 +325,7 @@ class Scheduler {
       weekBucketsIdx.push(bucket);
     }
     const dateByKey = new Map(windowDays.map(item => [item.dateKey, item.date]));
-    const isInTargetWindow = dateKey => {
-      const dt = dateByKey.get(dateKey);
-      if (!dt) return false;
-      return dt >= monthStartDate && dt <= monthEndDate;
-    };
+    const isInTargetWindow = dateKey => dateByKey.has(dateKey);
 
     const warnings = [];
     const violations = [];
@@ -318,7 +340,7 @@ class Scheduler {
       WEEK_BUCKET_BREAKOFF_MISSING_FIX_FIRST: "WEEK_BUCKET_BREAKOFF_MISSING_FIX_FIRST",
       WEEK_BUCKET_HAS_RSUN: "WEEK_BUCKET_HAS_RSUN",
       MAX_OFF_FULL: "MAX_OFF_FULL",
-      DAILY_RSUM_LIMIT: "DAILY_RSUM_LIMIT",
+      DAILY_RSUN_LIMIT: "DAILY_RSUN_LIMIT",
       SEVEN_DAY_WORK_VIOLATION: "SEVEN_DAY_WORK_VIOLATION",
       WOULD_CREATE_7TH_WORKDAY: "WOULD_CREATE_7TH_WORKDAY",
       MIN_REST_11H_VIOLATION: "MIN_REST_11H_VIOLATION",
@@ -332,7 +354,7 @@ class Scheduler {
 
     const fixedNightEmpSet = new Set();
     for (const rule of this.fixedRules) {
-      if (!String(rule.shiftCode || "").includes("常夜")) continue;
+      if (String(rule.shiftCode || "").trim() !== SHIFT_TYPES.LONG_NIGHT) continue;
       const rangeDates = expandDateRange(rule.dateFrom, rule.dateTo);
       const hasWindowOverlap = rangeDates.some(date => date >= windowStartDate && date <= windowDays[windowDays.length - 1].date);
       if (hasWindowOverlap) fixedNightEmpSet.add(rule.empId);
@@ -408,14 +430,25 @@ class Scheduler {
       return true;
     };
 
-    const maxConsecutiveWork = (empId, idxOverride, candidateCode) => {
+    const maxConsecutiveWork = (empId, idxOverride, candidateCode, options = {}) => {
       const byDate = plan.get(empId);
+      const historyByDate = historyPlan.get(empId);
       if (!byDate) return 0;
       let maxStreak = 0;
       let current = 0;
+      const streakCheck = options.strict ? isWorkDayForStreak : isWorkDayForStreakForAssign;
+      for (const dateKey of historyDateKeys) {
+        const code = historyByDate ? historyByDate.get(dateKey) : "";
+        if (streakCheck(code)) {
+          current += 1;
+          if (current > maxStreak) maxStreak = current;
+        } else {
+          current = 0;
+        }
+      }
       for (let i = 0; i < windowDays.length; i += 1) {
         const code = i === idxOverride ? candidateCode : byDate.get(dateKeys[i]);
-        if (isWorkDayForStreak(code)) {
+        if (streakCheck(code)) {
           current += 1;
           if (current > maxStreak) maxStreak = current;
         } else {
@@ -457,7 +490,7 @@ class Scheduler {
     const countOffInRange = (empId, startIdx, endIdx) => {
       let count = 0;
       for (let idx = startIdx; idx <= endIdx; idx += 1) {
-        if (hasOffCode(getCellCode(empId, dateKeys[idx]))) count += 1;
+        if (hasBreakOffCode(getCellCode(empId, dateKeys[idx]))) count += 1;
       }
       return count;
     };
@@ -473,7 +506,7 @@ class Scheduler {
     };
 
     const dailyOffCount = new Map(windowDays.map(item => [item.dateKey, 0]));
-    const dailyRsumCount = new Map(windowDays.map(item => [item.dateKey, 0]));
+    const dailyRsunCount = new Map(windowDays.map(item => [item.dateKey, 0]));
 
     const updateOffCount = dateKey => {
       let offCount = 0;
@@ -483,13 +516,13 @@ class Scheduler {
       }
       dailyOffCount.set(dateKey, offCount);
     };
-    const updateRsumCount = dateKey => {
+    const updateRsunCount = dateKey => {
       let count = 0;
       for (const person of this.people) {
         const code = getCellCode(person.empId, dateKey);
         if (code === SHIFT_TYPES.REST_WEEKLY) count += 1;
       }
-      dailyRsumCount.set(dateKey, count);
+      dailyRsunCount.set(dateKey, count);
     };
 
     const dailyLongNightCount = new Map(windowDays.map(item => [item.dateKey, 0]));
@@ -505,6 +538,12 @@ class Scheduler {
       const offCount = dailyOffCount.get(dateKey) || 0;
       return maxOff - offCount;
     };
+    const hasNightShift = (dateKey, shiftCode) => {
+      for (const person of this.people) {
+        if (getCellCode(person.empId, dateKey) === shiftCode) return true;
+      }
+      return false;
+    };
     const tryAssign = (empId, dateKey, code, status, reason) => {
       const normalized = normalizeShiftCode(code);
       if (normalized === "INVALID_MULTI_SHIFT" || normalized === "INVALID_SHIFT") {
@@ -512,18 +551,18 @@ class Scheduler {
         return false;
       }
       if (!normalized) return false;
+      const isSeedLock = status === CELL_STATUS.LOCKED_SEED || status === CELL_STATUS.LOCKED_LEAVE;
       if (normalized === SHIFT_TYPES.REST_WEEKLY) {
-        const existingCount = dailyRsumCount.get(dateKey) || 0;
-        const isSeedLock = status === CELL_STATUS.LOCKED_SEED || status === CELL_STATUS.LOCKED_LEAVE;
+        const existingCount = dailyRsunCount.get(dateKey) || 0;
         if (existingCount >= 1 && !isSeedLock) {
-          logViolation({ type: "daily_rsum_limit", empId, date: dateKey, code: normalized, reason });
+          logViolation({ type: "daily_R_sun_limit", empId, date: dateKey, code: normalized, reason });
           return false;
         }
       }
       if (normalized === SHIFT_TYPES.REST_WEEKLY || normalized === SHIFT_TYPES.REST_GENERAL) {
         const remaining = quotaRemainingByEmp.get(empId);
         if (remaining) {
-          const key = normalized === SHIFT_TYPES.REST_WEEKLY ? "R_sum" : "r";
+          const key = normalized === SHIFT_TYPES.REST_WEEKLY ? "R_sun" : "r";
           if ((remaining[key] || 0) <= 0) {
             logViolation({ type: "QUOTA_EXCEEDED", empId, date: dateKey, code: normalized, reason });
             return false;
@@ -538,7 +577,11 @@ class Scheduler {
       }
       if (normalized === coverageShiftCodes.night && (dailyLongNightCount.get(dateKey) || 0) >= 1) {
         logViolation({ type: "night_mutex", empId, date: dateKey, code: normalized, reason });
-        return false;
+        if (!isSeedLock) return false;
+      }
+      if (normalized === coverageShiftCodes.longNight && hasNightShift(dateKey, coverageShiftCodes.night)) {
+        logViolation({ type: "night_mutex", empId, date: dateKey, code: normalized, reason });
+        if (!isSeedLock) return false;
       }
       setCell(empId, dateKey, normalized, status || CELL_STATUS.ASSIGNED);
       if (normalized === coverageShiftCodes.longNight) {
@@ -546,7 +589,7 @@ class Scheduler {
       }
       if (hasOffCode(normalized)) {
         updateOffCount(dateKey);
-        updateRsumCount(dateKey);
+        updateRsunCount(dateKey);
         const maxOff = getMaxOff(dateKey);
         const offCount = dailyOffCount.get(dateKey) || 0;
         if (offCount > maxOff) {
@@ -565,7 +608,7 @@ class Scheduler {
       plan.get(empId).set(dateKey, "");
       statusPlan.get(empId).set(dateKey, CELL_STATUS.EMPTY);
       updateOffCount(dateKey);
-      updateRsumCount(dateKey);
+      updateRsunCount(dateKey);
     };
 
     const applySeedMatrix = (matrix, source) => {
@@ -586,16 +629,41 @@ class Scheduler {
         }
       }
     };
+    const applySeedHistory = (matrix, source) => {
+      if (!(matrix instanceof Map)) return;
+      for (const [empId, byDateSeed] of matrix.entries()) {
+        const byDate = historyPlan.get(empId);
+        if (!byDate) continue;
+        for (const [dateKey, rawCode] of byDateSeed.entries()) {
+          if (!historyDateKeySet.has(dateKey)) continue;
+          const normalized = normalizeSeedCode(rawCode);
+          if (!normalized) continue;
+          const result = normalizeShiftCode(normalized);
+          if (result === "INVALID_MULTI_SHIFT" || result === "INVALID_SHIFT") {
+            logViolation({ type: "invalid_shift_code", empId, date: dateKey, code: rawCode, source });
+            continue;
+          }
+          byDate.set(dateKey, normalized);
+        }
+      }
+    };
 
-    // Phase 0: seed existing schedule for the entire 35-day window
-    applySeedMatrix(options.seedMatrix, "seedMatrix");
-    applySeedMatrix(options.existingMatrix, "existingMatrix");
+    const hasSeedValue = (matrix, empId, dateKey) => {
+      if (!(matrix instanceof Map)) return false;
+      const byDate = matrix.get(empId);
+      if (!byDate) return false;
+      const code = byDate.get(dateKey);
+      return code !== "" && code !== null && code !== undefined;
+    };
 
     // Phase A: Leave (fixed off)
     for (const item of this.leave) {
       const dateKey = fmtDate(item.date);
       const byDate = plan.get(item.empId);
       if (!byDate || !byDate.has(dateKey)) continue;
+      if (hasSeedValue(options.seedMatrix, item.empId, dateKey) || hasSeedValue(options.existingMatrix, item.empId, dateKey)) {
+        continue;
+      }
       const normalized = normalizeShiftCode(item.leaveType);
       if (normalized === "INVALID_MULTI_SHIFT" || normalized === "INVALID_SHIFT") {
         logViolation({ type: "invalid_shift_code", empId: item.empId, date: dateKey, code: item.leaveType, source: "leave" });
@@ -604,32 +672,37 @@ class Scheduler {
       tryAssign(item.empId, dateKey, normalized, CELL_STATUS.LOCKED_LEAVE, "leave");
     }
 
+    // Phase B: seed existing schedule for the entire 35-day window
+    applySeedMatrix(options.seedMatrix, "seedMatrix");
+    applySeedMatrix(options.existingMatrix, "existingMatrix");
+    applySeedHistory(options.seedMatrix, "seedMatrix_history");
+
     // Phase B: seed from LAST and tally quota
-    const quotaCountByEmp = new Map(this.people.map(p => [p.empId, { R_sum: 0, r: 0 }]));
+    const quotaCountByEmp = new Map(this.people.map(p => [p.empId, { R_sun: 0, r: 0 }]));
     for (const person of this.people) {
       const byDate = plan.get(person.empId);
       if (!byDate) continue;
       for (const { dateKey } of windowDays) {
         const code = byDate.get(dateKey);
         if (code === SHIFT_TYPES.REST_WEEKLY) {
-          quotaCountByEmp.get(person.empId).R_sum += 1;
+          quotaCountByEmp.get(person.empId).R_sun += 1;
         }
         if (code === SHIFT_TYPES.REST_GENERAL) quotaCountByEmp.get(person.empId).r += 1;
       }
     }
     quotaRemainingByEmp.clear();
     for (const person of this.people) {
-      const used = quotaCountByEmp.get(person.empId) || { R_sum: 0, r: 0 };
+      const used = quotaCountByEmp.get(person.empId) || { R_sun: 0, r: 0 };
       const remaining = {
-        R_sum: Math.max(0, 5 - used.R_sum),
+        R_sun: Math.max(0, 5 - used.R_sun),
         r: Math.max(0, 5 - used.r)
       };
       quotaRemainingByEmp.set(person.empId, remaining);
-      if (used.r > 5 || used.R_sum > 5) {
+      if (used.r > 5 || used.R_sun > 5) {
         logViolation({
           type: "quota_exceeded_seeded",
           empId: person.empId,
-          details: `R_sum=${used.R_sum} r=${used.r}`
+          details: `R_sun=${used.R_sun} r=${used.r}`
         });
       }
     }
@@ -638,13 +711,13 @@ class Scheduler {
       if (!counts) return;
       const remaining = quotaRemainingByEmp.get(empId);
       if (!remaining) return;
-      remaining.R_sum = Math.max(0, 5 - counts.R_sum);
+      remaining.R_sun = Math.max(0, 5 - counts.R_sun);
       remaining.r = Math.max(0, 5 - counts.r);
     };
-    const adjustQuotaCounts = (empId, deltaRsum, deltaR) => {
+    const adjustQuotaCounts = (empId, deltaRsun, deltaR) => {
       const counts = quotaCountByEmp.get(empId);
       if (!counts) return;
-      counts.R_sum += deltaRsum;
+      counts.R_sun += deltaRsun;
       counts.r += deltaR;
       updateQuotaRemaining(empId);
     };
@@ -686,7 +759,7 @@ class Scheduler {
         const idx = dayIndex.get(dateKey);
         if (idx === undefined) continue;
         if (hasOffCode(byDate.get(dateKey))) continue;
-        if (String(shiftCode || "").includes("常夜")) continue;
+        if (String(shiftCode || "").trim() === SHIFT_TYPES.LONG_NIGHT) continue;
         if (byDate.get(dateKey)) continue;
         if (canAssign(person.empId, idx, shiftCode)) {
           if (!tryAssign(person.empId, dateKey, shiftCode, CELL_STATUS.LOCKED_SEED, "fixed_shift")) {
@@ -702,7 +775,7 @@ class Scheduler {
     for (let idx = 0; idx < windowDays.length; idx += 1) {
       const dateKey = dateKeys[idx];
       updateOffCount(dateKey);
-      updateRsumCount(dateKey);
+      updateRsunCount(dateKey);
       const demand = getDailyDemand(dateKey);
       const totalNeed = demand.early + demand.noon + demand.night;
       if (this.people.length < totalNeed) {
@@ -713,9 +786,9 @@ class Scheduler {
       if (offCount > maxOff) {
         logWarn({ type: "off_cap_exceeded_by_seed", date: dateKey, offCount, maxOff });
       }
-      const rsumCount = dailyRsumCount.get(dateKey) || 0;
-      if (rsumCount > 1) {
-        logViolation({ type: "daily_rsum_limit", date: dateKey, details: `count=${rsumCount}` });
+      const rsunCount = dailyRsunCount.get(dateKey) || 0;
+      if (rsunCount > 1) {
+        logViolation({ type: "daily_R_sun_limit", date: dateKey, details: `count=${rsunCount}` });
       }
       const leaveCount = dailyLeaveCounts.get(dateKey) || 0;
       if (leaveCount > maxOff) {
@@ -725,11 +798,11 @@ class Scheduler {
 
     const getNearestOffDistance = (empId, idx) => {
       let left = idx - 1;
-      while (left >= 0 && !hasOffCode(getCellCode(empId, dateKeys[left]))) {
+      while (left >= 0 && !hasBreakOffCode(getCellCode(empId, dateKeys[left]))) {
         left -= 1;
       }
       let right = idx + 1;
-      while (right < windowDays.length && !hasOffCode(getCellCode(empId, dateKeys[right]))) {
+      while (right < windowDays.length && !hasBreakOffCode(getCellCode(empId, dateKeys[right]))) {
         right += 1;
       }
       const leftDist = left >= 0 ? idx - left : windowDays.length;
@@ -744,7 +817,7 @@ class Scheduler {
     const getWeekBucket = idx => weekBucketsIdx[Math.floor(idx / 7)] || [];
     const hasOffInWeek = (empId, idx) => {
       const bucket = getWeekBucket(idx);
-      return bucket.some(dayIdx => hasOffCode(getCellCode(empId, dateKeys[dayIdx])));
+      return bucket.some(dayIdx => hasBreakOffCode(getCellCode(empId, dateKeys[dayIdx])));
     };
     const getDailyCoverageCounts = dateKey => {
       let early = 0;
@@ -796,12 +869,12 @@ class Scheduler {
       }
       return { ok: false, reasons: [CandidateFailReason.NOT_EMPTY] };
     };
-    const evaluateRsumCandidate = (empId, idx, options) => {
+    const evaluateRsunCandidate = (empId, idx, options) => {
       const base = evaluateOffCandidate(empId, idx, options);
       if (!base.ok) return base;
       const dateKey = dateKeys[idx];
-      if ((dailyRsumCount.get(dateKey) || 0) >= 1) {
-        return { ok: false, reasons: [CandidateFailReason.DAILY_RSUM_LIMIT] };
+      if ((dailyRsunCount.get(dateKey) || 0) >= 1) {
+        return { ok: false, reasons: [CandidateFailReason.DAILY_RSUN_LIMIT] };
       }
       return base;
     };
@@ -865,7 +938,7 @@ class Scheduler {
       });
       return { candidates, failures };
     };
-    const getRsumCandidates = empId => collectCandidates(empId, evaluateRsumCandidate, {
+    const getRsunCandidates = empId => collectCandidates(empId, evaluateRsunCandidate, {
       allowReplaceWork: true,
       allowReplaceR: true,
       preferWeekBreakOffMissing: true,
@@ -875,18 +948,61 @@ class Scheduler {
       allowReplaceWork: true,
       allowReplaceR: false
     });
+    const fillWeeklyRsun = empId => {
+      for (const bucket of weekBucketsIdx) {
+        const hasRsun = bucket.some(idx => getCellCode(empId, dateKeys[idx]) === SHIFT_TYPES.REST_WEEKLY);
+        if (hasRsun) continue;
+        const remaining = (quotaRemainingByEmp.get(empId) || {}).R_sun || 0;
+        if (remaining <= 0) {
+          logWarn({ type: "missing_weekly_R_sun_quota", empId, weekStart: dateKeys[bucket[0]] });
+          continue;
+        }
+        const candidates = [];
+        for (const idx of bucket) {
+          const result = evaluateRsunCandidate(empId, idx, {
+            allowReplaceWork: true,
+            allowReplaceR: true
+          });
+          if (result.ok) {
+            candidates.push({
+              idx,
+              type: result.type,
+              softPenalty: (result.softReasons || []).length
+            });
+          }
+        }
+        const priority = { EMPTY: 0, REPLACE_WORK: 1, REPLACE_R: 2 };
+        candidates.sort((a, b) => {
+          if (priority[a.type] !== priority[b.type]) return priority[a.type] - priority[b.type];
+          if (a.softPenalty !== b.softPenalty) return a.softPenalty - b.softPenalty;
+          return a.idx - b.idx;
+        });
+        let filled = false;
+        for (const candidate of candidates) {
+          const precheck = canApplyOffCandidate(empId, candidate.idx, candidate.type);
+          if (!precheck.ok) continue;
+          if (replaceCellWithOff(empId, candidate.idx, SHIFT_TYPES.REST_WEEKLY, CELL_STATUS.ASSIGNED, "weekly_R_sun")) {
+            filled = true;
+            break;
+          }
+        }
+        if (!filled) {
+          logWarn({ type: "weekly_R_sun_missing", empId, weekStart: dateKeys[bucket[0]] });
+        }
+      }
+    };
     const canRemoveOff = (empId, idx) => {
       const dateKey = dateKeys[idx];
       const status = getCellStatus(empId, dateKey);
       if (status === CELL_STATUS.LOCKED_LEAVE || status === CELL_STATUS.LOCKED_SEED) return false;
       if (!hasBreakOffCode(getCellCode(empId, dateKey))) return false;
-      for (let startIdx = 0; startIdx <= windowDays.length - 7; startIdx += 1) {
-        const endIdx = startIdx + 6;
-        let count = countOffInRange(empId, startIdx, endIdx);
-        if (idx >= startIdx && idx <= endIdx) count -= 1;
-        if (count <= 0) {
-          return false;
+      for (const bucket of weekBucketsIdx) {
+        let count = 0;
+        for (const dayIdx of bucket) {
+          if (dayIdx === idx) continue;
+          if (hasBreakOffCode(getCellCode(empId, dateKeys[dayIdx]))) count += 1;
         }
+        if (count <= 0) return false;
       }
       return true;
     };
@@ -903,24 +1019,18 @@ class Scheduler {
     const canApplyOffCandidate = (empId, idx, type) => {
       const dateKey = dateKeys[idx];
       const reasons = [];
-      if (type === "EMPTY" && getOffRemaining(dateKey) <= 0) {
-        reasons.push(CandidateFailReason.MAX_OFF_FULL);
-      }
       if (type === "REPLACE_WORK") {
         const code = getCellCode(empId, dateKey);
         if (wouldBreakCoverage(dateKey, code)) {
           reasons.push(CandidateFailReason.DEMAND_UNDERCOVER);
         }
-        if (getOffRemaining(dateKey) <= 0) {
-          reasons.push(CandidateFailReason.MAX_OFF_FULL);
-        }
       }
       return reasons.length ? { ok: false, reasons } : { ok: true, reasons: [] };
     };
-    const fillRsumQuota = empId => {
-      let remaining = (quotaRemainingByEmp.get(empId) || {}).R_sum || 0;
+    const fillRsunQuota = empId => {
+      let remaining = (quotaRemainingByEmp.get(empId) || {}).R_sun || 0;
       while (remaining > 0) {
-        const { candidates, failures } = getRsumCandidates(empId);
+        const { candidates, failures } = getRsunCandidates(empId);
         let filled = false;
         const attemptFailures = [...failures];
         for (const candidate of candidates) {
@@ -929,15 +1039,15 @@ class Scheduler {
             attemptFailures.push({ date: dateKeys[candidate.idx], reasons: precheck.reasons });
             continue;
           }
-          if (replaceCellWithOff(empId, candidate.idx, SHIFT_TYPES.REST_WEEKLY, CELL_STATUS.ASSIGNED, "rsum_fill")) {
+          if (replaceCellWithOff(empId, candidate.idx, SHIFT_TYPES.REST_WEEKLY, CELL_STATUS.ASSIGNED, "rsun_fill")) {
             filled = true;
-            remaining = (quotaRemainingByEmp.get(empId) || {}).R_sum || 0;
+            remaining = (quotaRemainingByEmp.get(empId) || {}).R_sun || 0;
             break;
           }
         }
         if (!filled) {
-          logWarn({ type: "missing_quota", empId, quotaType: "R_sum", remaining });
-          logCandidateFailureSummary(empId, "R_sum", remaining, attemptFailures);
+          logWarn({ type: "missing_quota", empId, quotaType: "R_sun", remaining });
+          logCandidateFailureSummary(empId, "R_sun", remaining, attemptFailures);
           break;
         }
       }
@@ -1029,7 +1139,7 @@ class Scheduler {
     const repairOverQuota = () => {
       for (const person of this.people) {
         const empId = person.empId;
-        let totalR = quotaCountByEmp.get(empId).R_sum || 0;
+        let totalR = quotaCountByEmp.get(empId).R_sun || 0;
         if (totalR > 5) {
           const removable = [];
           for (let idx = 0; idx < windowDays.length; idx += 1) {
@@ -1047,7 +1157,7 @@ class Scheduler {
           }
         }
         if (totalR > 5) {
-          logViolation({ type: "quota_Rsum_over", empId, details: `limit=5 actual=${totalR}` });
+          logViolation({ type: "quota_R_sun_over", empId, details: `limit=5 actual=${totalR}` });
         }
       }
 
@@ -1084,7 +1194,7 @@ class Scheduler {
         }
       }
     };
-    const repairAdjacentRestForRsum = () => {
+    const repairAdjacentRestForRsun = () => {
       for (const person of this.people) {
         const empId = person.empId;
         const remainingR = (quotaRemainingByEmp.get(empId) || {}).r || 0;
@@ -1111,7 +1221,7 @@ class Scheduler {
           for (const candidateIdx of candidateSides) {
             if (!canAssignOff(empId, candidateIdx)) continue;
             if (getOffRemaining(dateKeys[candidateIdx]) <= 0) continue;
-            if (replaceCellWithOff(empId, candidateIdx, SHIFT_TYPES.REST_GENERAL, CELL_STATUS.ASSIGNED, "rsum_adjacent_r")) {
+            if (replaceCellWithOff(empId, candidateIdx, SHIFT_TYPES.REST_GENERAL, CELL_STATUS.ASSIGNED, "rsun_adjacent_r")) {
               break;
             }
           }
@@ -1119,18 +1229,19 @@ class Scheduler {
       }
     };
 
-    // Phase D: fill OFF quotas (R_sum then r), repair, then lock OFF
+    // Phase D: fill OFF quotas (R_sun then r), repair, then lock OFF
     for (const person of this.people) {
-      fillRsumQuota(person.empId);
+      fillWeeklyRsun(person.empId);
+      fillRsunQuota(person.empId);
     }
     fillRQuota();
     repairOverQuota();
     for (const person of this.people) {
-      const remainingRsum = (quotaRemainingByEmp.get(person.empId) || {}).R_sum || 0;
-      if (remainingRsum > 0) fillRsumQuota(person.empId);
+      const remainingRsun = (quotaRemainingByEmp.get(person.empId) || {}).R_sun || 0;
+      if (remainingRsun > 0) fillRsunQuota(person.empId);
     }
     fillRQuota();
-    repairAdjacentRestForRsum();
+    repairAdjacentRestForRsun();
     for (const person of this.people) {
       const byDate = plan.get(person.empId);
       const statusByDate = statusPlan.get(person.empId);
@@ -1143,7 +1254,7 @@ class Scheduler {
       }
     }
 
-    // Phase E: assign long night LN
+    // Phase E: assign long night L
     for (const empId of fixedNightEmpSet) {
       for (let idx = 0; idx < windowDays.length; idx += 1) {
         const dateKey = dateKeys[idx];
@@ -1210,25 +1321,16 @@ class Scheduler {
       }
     }
 
-    const dailyNightTaken = new Map(windowDays.map(item => [item.dateKey, false]));
-    for (const { dateKey } of windowDays) {
-      if ((dailyLongNightCount.get(dateKey) || 0) >= 1) {
-        dailyNightTaken.set(dateKey, true);
-      }
-    }
-
     // Phase F: fill night coverage N
     for (let idx = 0; idx < windowDays.length; idx += 1) {
       const dateKey = dateKeys[idx];
       const demand = getDailyDemand(dateKey);
-      if (dailyNightTaken.get(dateKey)) continue;
-      const needNTotal = demand.night;
-      for (let count = 0; count < needNTotal; count += 1) {
+      if ((dailyLongNightCount.get(dateKey) || 0) >= 1) continue;
+      const counts = getDailyCoverageCounts(dateKey);
+      for (let count = counts.night; count < demand.night; count += 1) {
         const candidate = pickCandidate(idx, coverageShiftCodes.night, { exclude: fixedNightEmpSet });
         if (candidate) {
-          if (markAssigned(candidate, idx, coverageShiftCodes.night, CELL_STATUS.LOCKED_N, "night_fill")) {
-            dailyNightTaken.set(dateKey, true);
-          }
+          markAssigned(candidate, idx, coverageShiftCodes.night, CELL_STATUS.LOCKED_N, "night_fill");
         } else {
           logWarn({ type: "no_feasible_night", date: dateKey, reason: "minRest/leave/offCap" });
           break;
@@ -1297,11 +1399,11 @@ class Scheduler {
         let nightCount = 0;
         let longNightCount = 0;
         let offCount = 0;
-        let rsumCount = 0;
+        let rsunCount = 0;
         for (const person of this.people) {
           const code = plan.get(person.empId).get(dateKey);
           if (hasOffCode(code)) offCount += 1;
-          if (code === SHIFT_TYPES.REST_WEEKLY) rsumCount += 1;
+          if (code === SHIFT_TYPES.REST_WEEKLY) rsunCount += 1;
           if (code === coverageShiftCodes.early) earlyCount += 1;
           if (code === coverageShiftCodes.noon) noonCount += 1;
           if (code === coverageShiftCodes.night) nightCount += 1;
@@ -1320,11 +1422,11 @@ class Scheduler {
             availableCount
           });
         }
-        if (rsumCount > 1) {
-          logViolation({ date: dateKey, type: "daily_rsum_limit", details: `count=${rsumCount}` });
+        if (rsunCount > 1) {
+          logViolation({ date: dateKey, type: "daily_R_sun_limit", details: `count=${rsunCount}` });
         }
         if (longNightCount >= 1 && nightCount > 0) {
-          logViolation({ date: dateKey, type: "night_mutual_exclusion", details: `LN=${longNightCount} N=${nightCount}` });
+          logViolation({ date: dateKey, type: "night_mutual_exclusion", details: `L=${longNightCount} N=${nightCount}` });
         }
         const maxOff = getMaxOff(dateKey);
         if (offCount > maxOff) {
@@ -1338,19 +1440,20 @@ class Scheduler {
         const weeklyRCount = windowDays.reduce((sum, { dateKey }) => sum + (byDate.get(dateKey) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
         const rCount = windowDays.reduce((sum, { dateKey }) => sum + (byDate.get(dateKey) === SHIFT_TYPES.REST_GENERAL ? 1 : 0), 0);
         if (weeklyRCount !== 5) {
-          logViolation({ empId: person.empId, type: "quota_Rsum", details: `limit=5 actual=${weeklyRCount}` });
+          logViolation({ empId: person.empId, type: "quota_R_sun", details: `limit=5 actual=${weeklyRCount}` });
         }
         if (rCount !== 5) {
           logViolation({ empId: person.empId, type: "quota_r", details: `limit=5 actual=${rCount}` });
         }
-
-        for (let startIdx = 0; startIdx <= windowDays.length - 7; startIdx += 1) {
-          const endIdx = startIdx + 6;
-          if (countOffInRange(person.empId, startIdx, endIdx) === 0) {
-            logViolation({ empId: person.empId, type: "seven_day_off_missing", details: `start=${dateKeys[startIdx]} end=${dateKeys[endIdx]}` });
+        for (const bucket of weekBucketsIdx) {
+          const hasWeekOff = bucket.some(dayIdx => hasBreakOffCode(byDate.get(dateKeys[dayIdx])));
+          if (!hasWeekOff) {
+            const startKey = dateKeys[bucket[0]];
+            const endKey = dateKeys[bucket[bucket.length - 1]];
+            logViolation({ empId: person.empId, type: "weekly_off_missing", details: `start=${startKey} end=${endKey}` });
           }
         }
-        const maxStreak = maxConsecutiveWork(person.empId, -1, null);
+        const maxStreak = maxConsecutiveWork(person.empId, -1, null, { strict: true });
         if (maxStreak > 6) {
           logViolation({ empId: person.empId, type: "seven_day_work_violation", details: `maxStreak=${maxStreak}` });
         }
@@ -1416,20 +1519,20 @@ class Scheduler {
           if (code === SHIFT_TYPES.REST_GENERAL) rCount += 1;
         }
         if (weeklyRCount !== 5) {
-          logViolation({ empId: person.empId, type: "quota_Rsum", details: `limit=5 actual=${weeklyRCount}` });
+          logViolation({ empId: person.empId, type: "quota_R_sun", details: `limit=5 actual=${weeklyRCount}` });
           ok = false;
         }
         if (rCount !== 5) {
           logViolation({ empId: person.empId, type: "quota_r", details: `limit=5 actual=${rCount}` });
           ok = false;
         }
-        const remainingRsum = Math.max(0, 5 - weeklyRCount);
-        if (remainingRsum > 0) {
-          const failures = collectCandidates(person.empId, evaluateRsumCandidate, {
+        const remainingRsun = Math.max(0, 5 - weeklyRCount);
+        if (remainingRsun > 0) {
+          const failures = collectCandidates(person.empId, evaluateRsunCandidate, {
             allowReplaceWork: true,
             allowReplaceR: true
           }).failures;
-          logCandidateFailureSummary(person.empId, "R_sum", remainingRsum, failures);
+          logCandidateFailureSummary(person.empId, "R_sun", remainingRsun, failures);
         }
         const remainingR = Math.max(0, 5 - rCount);
         if (remainingR > 0) {
@@ -1439,14 +1542,16 @@ class Scheduler {
           }).failures;
           logCandidateFailureSummary(person.empId, "r", remainingR, failures);
         }
-        for (let startIdx = 0; startIdx <= windowDays.length - 7; startIdx += 1) {
-          const endIdx = startIdx + 6;
-          if (countOffInRange(person.empId, startIdx, endIdx) === 0) {
-            logViolation({ empId: person.empId, type: "seven_day_off_missing", details: `start=${dateKeys[startIdx]} end=${dateKeys[endIdx]}` });
+        for (const bucket of weekBucketsIdx) {
+          const hasWeekOff = bucket.some(dayIdx => hasBreakOffCode(byDate.get(dateKeys[dayIdx])));
+          if (!hasWeekOff) {
+            const startKey = dateKeys[bucket[0]];
+            const endKey = dateKeys[bucket[bucket.length - 1]];
+            logViolation({ empId: person.empId, type: "weekly_off_missing", details: `start=${startKey} end=${endKey}` });
             ok = false;
           }
         }
-        const maxStreak = maxConsecutiveWork(person.empId, -1, null);
+        const maxStreak = maxConsecutiveWork(person.empId, -1, null, { strict: true });
         if (maxStreak > 6) {
           logViolation({ empId: person.empId, type: "seven_day_work_violation", details: `maxStreak=${maxStreak}` });
           ok = false;
@@ -1456,29 +1561,85 @@ class Scheduler {
       for (const { dateKey } of windowDays) {
         let longNightCount = 0;
         let nightCount = 0;
-        let rsumCount = 0;
+        let rsunCount = 0;
         for (const person of this.people) {
           const code = plan.get(person.empId).get(dateKey);
           if (code === coverageShiftCodes.longNight) longNightCount += 1;
           if (code === coverageShiftCodes.night) nightCount += 1;
-          if (code === SHIFT_TYPES.REST_WEEKLY) rsumCount += 1;
+          if (code === SHIFT_TYPES.REST_WEEKLY) rsunCount += 1;
         }
         if (longNightCount >= 1 && nightCount > 0) {
-          logViolation({ date: dateKey, type: "night_mutual_exclusion", details: `LN=${longNightCount} N=${nightCount}` });
+          logViolation({ date: dateKey, type: "night_mutual_exclusion", details: `L=${longNightCount} N=${nightCount}` });
           ok = false;
         }
-        if (rsumCount > 1) {
-          logViolation({ date: dateKey, type: "daily_rsum_limit", details: `count=${rsumCount}` });
+        if (rsunCount > 1) {
+          logViolation({ date: dateKey, type: "daily_R_sun_limit", details: `count=${rsunCount}` });
           ok = false;
         }
       }
       return ok;
     };
 
+    const combinedDateKeys = [...historyDateKeys, ...dateKeys];
+    const combinedIndexByKey = new Map(combinedDateKeys.map((key, idx) => [key, idx]));
+    const getCodeByDateKey = (empId, dateKey) => {
+      const byDate = plan.get(empId);
+      if (byDate && byDate.has(dateKey)) return byDate.get(dateKey);
+      const historyByDate = historyPlan.get(empId);
+      if (historyByDate && historyByDate.has(dateKey)) return historyByDate.get(dateKey);
+      return "";
+    };
+    const getHistorySnapshot = (empId, dateKey) => {
+      const idx = combinedIndexByKey.get(dateKey);
+      if (idx === undefined) return [];
+      const startIdx = Math.max(0, idx - historyLength);
+      const snapshot = [];
+      for (let i = startIdx; i < idx; i += 1) {
+        const key = combinedDateKeys[i];
+        snapshot.push({ date: key, code: getCodeByDateKey(empId, key) });
+      }
+      return snapshot;
+    };
+    const getStreakSegment = (empId, dateKey) => {
+      const idx = combinedIndexByKey.get(dateKey);
+      if (idx === undefined) return [];
+      let startIdx = idx;
+      while (startIdx - 1 >= 0 && isWorkDayForStreak(getCodeByDateKey(empId, combinedDateKeys[startIdx - 1]))) {
+        startIdx -= 1;
+      }
+      let endIdx = idx;
+      while (endIdx + 1 < combinedDateKeys.length && isWorkDayForStreak(getCodeByDateKey(empId, combinedDateKeys[endIdx + 1]))) {
+        endIdx += 1;
+      }
+      const segment = [];
+      for (let i = startIdx; i <= endIdx; i += 1) {
+        const key = combinedDateKeys[i];
+        segment.push({ date: key, code: getCodeByDateKey(empId, key) });
+      }
+      return segment;
+    };
+    const buildViolationReport = () => violations.map(violation => {
+      const empId = violation.empId;
+      const dateKey = violation.date;
+      if (!empId || !dateKey) return violation;
+      return {
+        ...violation,
+        code: getCodeByDateKey(empId, dateKey),
+        history6: getHistorySnapshot(empId, dateKey),
+        streakSegment: getStreakSegment(empId, dateKey)
+      };
+    });
+
     const validation = validatePlanDetailed();
     const finalOk = validateFinal();
+    const violationReport = finalOk ? [] : buildViolationReport();
     for (const violation of violations) {
       Logger.log(`[VIOLATION] ${JSON.stringify(violation)}`);
+    }
+    if (!finalOk) {
+      for (const entry of violationReport) {
+        Logger.log(`[VIOLATION_REPORT] ${JSON.stringify(entry)}`);
+      }
     }
     for (const warning of warnings) {
       Logger.log(`[WARN] ${JSON.stringify(warning)}`);
@@ -1492,11 +1653,16 @@ class Scheduler {
     }
 
     this.monthPlan = { month, days, windowDays, plan };
-    return this.monthPlan;
+    this.validationOk = finalOk;
+    this.violations = violations;
+    this.warnings = warnings;
+    this.violationReport = violationReport;
+    return { ok: finalOk, violations, warnings, violationReport };
   }
 
   toMonthMatrix() {
     if (!this.monthPlan) throw new Error("Month plan not built");
+    if (this.validationOk === false) throw new Error("Final validation failed. Month plan not available.");
     const dowRow = ["empId", "name", ...this.monthPlan.days.map(d => "日一二三四五六"[dow_(d.date)])];
     const dayRow = ["empId", "name", ...this.monthPlan.days.map(d => d.day)];
     const headers = [dowRow, dayRow];
@@ -1514,6 +1680,7 @@ class Scheduler {
 
   toWindowMatrix() {
     if (!this.monthPlan) throw new Error("Month plan not built");
+    if (this.validationOk === false) throw new Error("Final validation failed. Window plan not available.");
     const dowRow = ["empId", "name", ...this.monthPlan.windowDays.map(d => "日一二三四五六"[dow_(d.date)])];
     const dayRow = ["empId", "name", ...this.monthPlan.windowDays.map(d => d.date.getDate())];
     const headers = [dowRow, dayRow];
