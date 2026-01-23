@@ -242,7 +242,6 @@ class Scheduler {
       return code;
     };
 
-
     const normalizeSeedCode = (dateKey, code) => {
       if (!code) return "";
       if (code === SHIFT_TYPES.REST_SUN || code === SHIFT_TYPES.REST_GENERAL) return code;
@@ -476,10 +475,9 @@ class Scheduler {
       return tryAssign(empId, dateKey, code, status, reason);
     };
 
-    // Phase 0: seed existing schedule for the entire 35-day window
-    const seedMatrix = options.seedMatrix instanceof Map ? options.seedMatrix : null;
-    if (seedMatrix) {
-      for (const [empId, byDateSeed] of seedMatrix.entries()) {
+    const applySeedMatrix = (matrix, source) => {
+      if (!(matrix instanceof Map)) return;
+      for (const [empId, byDateSeed] of matrix.entries()) {
         const byDate = plan.get(empId);
         if (!byDate) continue;
         for (const [dateKey, rawCode] of byDateSeed.entries()) {
@@ -488,13 +486,17 @@ class Scheduler {
           if (!normalized) continue;
           const result = normalizeShiftCode(normalized);
           if (result === "INVALID_MULTI_SHIFT" || result === "INVALID_SHIFT") {
-            logViolation({ type: "invalid_shift_code", empId, date: dateKey, code: rawCode, source: "seedMatrix" });
+            logViolation({ type: "invalid_shift_code", empId, date: dateKey, code: rawCode, source });
             continue;
           }
-          tryAssign(empId, dateKey, normalized, CELL_STATUS.LOCKED_SEED, "seedMatrix");
+          tryAssign(empId, dateKey, normalized, CELL_STATUS.LOCKED_SEED, source);
         }
       }
-    }
+    };
+
+    // Phase 0: seed existing schedule for the entire 35-day window
+    applySeedMatrix(options.seedMatrix, "seedMatrix");
+    applySeedMatrix(options.existingMatrix, "existingMatrix");
 
     // Phase A: Leave (fixed off)
     for (const item of this.leave) {

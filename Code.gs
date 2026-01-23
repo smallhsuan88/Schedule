@@ -18,7 +18,8 @@ function runGenerateSchedule() {
   const windowEndDate = new Date(windowStartDate);
   windowEndDate.setDate(windowEndDate.getDate() + 34);
   const seedMatrix = repo.getLastSchedule(windowStartDate, windowEndDate);
-  scheduler.buildMonthPlan(monthStr, { seedMatrix });
+  const existingMatrix = repo.getExistingSchedule(windowStartDate, windowEndDate);
+  scheduler.buildMonthPlan(monthStr, { seedMatrix, existingMatrix });
   const { headers, matrix } = scheduler.toMonthMatrix();
   const { headers: lastHeaders, matrix: lastMatrix } = scheduler.toWindowMatrix();
 
