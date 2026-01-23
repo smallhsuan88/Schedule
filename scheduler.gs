@@ -143,8 +143,8 @@ class Scheduler {
     }
 
     const windowStartDate = new Date(monthStartDate);
-    windowStartDate.setDate(windowStartDate.getDate() - 6);
-    const windowLength = Math.max(35, daysInMonth + 6);
+    windowStartDate.setDate(windowStartDate.getDate() - windowStartDate.getDay());
+    const windowLength = 35;
     const windowDays = [];
     for (let i = 0; i < windowLength; i += 1) {
       const dt = new Date(windowStartDate);
@@ -165,7 +165,7 @@ class Scheduler {
       NIGHT: "N",
       LONG_NIGHT: "LN",
       OFF: "OFF",
-      REST_WEEKLY: "R_sun",
+      REST_WEEKLY: "R_sum",
       REST_GENERAL: "r"
     });
     const softPreference = {
@@ -272,7 +272,7 @@ class Scheduler {
     const isOtherLeaveCode = code => isLeaveCode_(code);
     const isOffCode = code => isBreakOffCode(code) || isOtherLeaveCode(code);
     const isWorkCode = code => Boolean(code) && !isOffCode(code);
-    const isWorkDayForStreak = code => !isBreakOffCode(code);
+    const isWorkDayForStreak = code => !isOffCode(code);
     const isNightCode_ = code => code === coverageShiftCodes.night || code === coverageShiftCodes.longNight || String(code || "").includes("常夜");
     const isEarlyCode_ = code => code === "早" || code === "早L";
     const isNoonCode_ = code => code === "午" || code === "午L";
@@ -318,6 +318,7 @@ class Scheduler {
       WEEK_BUCKET_BREAKOFF_MISSING_FIX_FIRST: "WEEK_BUCKET_BREAKOFF_MISSING_FIX_FIRST",
       WEEK_BUCKET_HAS_RSUN: "WEEK_BUCKET_HAS_RSUN",
       MAX_OFF_FULL: "MAX_OFF_FULL",
+      DAILY_RSUM_LIMIT: "DAILY_RSUM_LIMIT",
       SEVEN_DAY_WORK_VIOLATION: "SEVEN_DAY_WORK_VIOLATION",
       WOULD_CREATE_7TH_WORKDAY: "WOULD_CREATE_7TH_WORKDAY",
       MIN_REST_11H_VIOLATION: "MIN_REST_11H_VIOLATION",
@@ -453,10 +454,10 @@ class Scheduler {
       return true;
     };
 
-    const countBreakOffInRange = (empId, startIdx, endIdx) => {
+    const countOffInRange = (empId, startIdx, endIdx) => {
       let count = 0;
       for (let idx = startIdx; idx <= endIdx; idx += 1) {
-        if (hasBreakOffCode(getCellCode(empId, dateKeys[idx]))) count += 1;
+        if (hasOffCode(getCellCode(empId, dateKeys[idx]))) count += 1;
       }
       return count;
     };
@@ -472,6 +473,7 @@ class Scheduler {
     };
 
     const dailyOffCount = new Map(windowDays.map(item => [item.dateKey, 0]));
+    const dailyRsumCount = new Map(windowDays.map(item => [item.dateKey, 0]));
 
     const updateOffCount = dateKey => {
       let offCount = 0;
@@ -480,6 +482,14 @@ class Scheduler {
         if (hasOffCode(code)) offCount += 1;
       }
       dailyOffCount.set(dateKey, offCount);
+    };
+    const updateRsumCount = dateKey => {
+      let count = 0;
+      for (const person of this.people) {
+        const code = getCellCode(person.empId, dateKey);
+        if (code === SHIFT_TYPES.REST_WEEKLY) count += 1;
+      }
+      dailyRsumCount.set(dateKey, count);
     };
 
     const dailyLongNightCount = new Map(windowDays.map(item => [item.dateKey, 0]));
@@ -502,10 +512,18 @@ class Scheduler {
         return false;
       }
       if (!normalized) return false;
+      if (normalized === SHIFT_TYPES.REST_WEEKLY) {
+        const existingCount = dailyRsumCount.get(dateKey) || 0;
+        const isSeedLock = status === CELL_STATUS.LOCKED_SEED || status === CELL_STATUS.LOCKED_LEAVE;
+        if (existingCount >= 1 && !isSeedLock) {
+          logViolation({ type: "daily_rsum_limit", empId, date: dateKey, code: normalized, reason });
+          return false;
+        }
+      }
       if (normalized === SHIFT_TYPES.REST_WEEKLY || normalized === SHIFT_TYPES.REST_GENERAL) {
         const remaining = quotaRemainingByEmp.get(empId);
         if (remaining) {
-          const key = normalized === SHIFT_TYPES.REST_WEEKLY ? "R_sun" : "r";
+          const key = normalized === SHIFT_TYPES.REST_WEEKLY ? "R_sum" : "r";
           if ((remaining[key] || 0) <= 0) {
             logViolation({ type: "QUOTA_EXCEEDED", empId, date: dateKey, code: normalized, reason });
             return false;
@@ -528,6 +546,7 @@ class Scheduler {
       }
       if (hasOffCode(normalized)) {
         updateOffCount(dateKey);
+        updateRsumCount(dateKey);
         const maxOff = getMaxOff(dateKey);
         const offCount = dailyOffCount.get(dateKey) || 0;
         if (offCount > maxOff) {
@@ -546,6 +565,7 @@ class Scheduler {
       plan.get(empId).set(dateKey, "");
       statusPlan.get(empId).set(dateKey, CELL_STATUS.EMPTY);
       updateOffCount(dateKey);
+      updateRsumCount(dateKey);
     };
 
     const applySeedMatrix = (matrix, source) => {
@@ -585,31 +605,31 @@ class Scheduler {
     }
 
     // Phase B: seed from LAST and tally quota
-    const quotaCountByEmp = new Map(this.people.map(p => [p.empId, { R_sun: 0, r: 0 }]));
+    const quotaCountByEmp = new Map(this.people.map(p => [p.empId, { R_sum: 0, r: 0 }]));
     for (const person of this.people) {
       const byDate = plan.get(person.empId);
       if (!byDate) continue;
       for (const { dateKey } of windowDays) {
         const code = byDate.get(dateKey);
         if (code === SHIFT_TYPES.REST_WEEKLY) {
-          quotaCountByEmp.get(person.empId).R_sun += 1;
+          quotaCountByEmp.get(person.empId).R_sum += 1;
         }
         if (code === SHIFT_TYPES.REST_GENERAL) quotaCountByEmp.get(person.empId).r += 1;
       }
     }
     quotaRemainingByEmp.clear();
     for (const person of this.people) {
-      const used = quotaCountByEmp.get(person.empId) || { R_sun: 0, r: 0 };
+      const used = quotaCountByEmp.get(person.empId) || { R_sum: 0, r: 0 };
       const remaining = {
-        R_sun: Math.max(0, 5 - used.R_sun),
+        R_sum: Math.max(0, 5 - used.R_sum),
         r: Math.max(0, 5 - used.r)
       };
       quotaRemainingByEmp.set(person.empId, remaining);
-      if (used.r > 5 || used.R_sun > 5) {
+      if (used.r > 5 || used.R_sum > 5) {
         logViolation({
           type: "quota_exceeded_seeded",
           empId: person.empId,
-          details: `R_sun=${used.R_sun} r=${used.r}`
+          details: `R_sum=${used.R_sum} r=${used.r}`
         });
       }
     }
@@ -618,13 +638,13 @@ class Scheduler {
       if (!counts) return;
       const remaining = quotaRemainingByEmp.get(empId);
       if (!remaining) return;
-      remaining.R_sun = Math.max(0, 5 - counts.R_sun);
+      remaining.R_sum = Math.max(0, 5 - counts.R_sum);
       remaining.r = Math.max(0, 5 - counts.r);
     };
-    const adjustQuotaCounts = (empId, deltaRsun, deltaR) => {
+    const adjustQuotaCounts = (empId, deltaRsum, deltaR) => {
       const counts = quotaCountByEmp.get(empId);
       if (!counts) return;
-      counts.R_sun += deltaRsun;
+      counts.R_sum += deltaRsum;
       counts.r += deltaR;
       updateQuotaRemaining(empId);
     };
@@ -682,6 +702,7 @@ class Scheduler {
     for (let idx = 0; idx < windowDays.length; idx += 1) {
       const dateKey = dateKeys[idx];
       updateOffCount(dateKey);
+      updateRsumCount(dateKey);
       const demand = getDailyDemand(dateKey);
       const totalNeed = demand.early + demand.noon + demand.night;
       if (this.people.length < totalNeed) {
@@ -692,6 +713,10 @@ class Scheduler {
       if (offCount > maxOff) {
         logWarn({ type: "off_cap_exceeded_by_seed", date: dateKey, offCount, maxOff });
       }
+      const rsumCount = dailyRsumCount.get(dateKey) || 0;
+      if (rsumCount > 1) {
+        logViolation({ type: "daily_rsum_limit", date: dateKey, details: `count=${rsumCount}` });
+      }
       const leaveCount = dailyLeaveCounts.get(dateKey) || 0;
       if (leaveCount > maxOff) {
         logWarn({ type: "off_cap_exceeded_by_leave", date: dateKey, leaveCount, maxOff });
@@ -700,11 +725,11 @@ class Scheduler {
 
     const getNearestOffDistance = (empId, idx) => {
       let left = idx - 1;
-      while (left >= 0 && !hasBreakOffCode(getCellCode(empId, dateKeys[left]))) {
+      while (left >= 0 && !hasOffCode(getCellCode(empId, dateKeys[left]))) {
         left -= 1;
       }
       let right = idx + 1;
-      while (right < windowDays.length && !hasBreakOffCode(getCellCode(empId, dateKeys[right]))) {
+      while (right < windowDays.length && !hasOffCode(getCellCode(empId, dateKeys[right]))) {
         right += 1;
       }
       const leftDist = left >= 0 ? idx - left : windowDays.length;
@@ -717,13 +742,9 @@ class Scheduler {
       || status === CELL_STATUS.LOCKED_LN
       || status === CELL_STATUS.LOCKED_N;
     const getWeekBucket = idx => weekBucketsIdx[Math.floor(idx / 7)] || [];
-    const hasRsunInWeek = (empId, idx) => {
+    const hasOffInWeek = (empId, idx) => {
       const bucket = getWeekBucket(idx);
-      return bucket.some(dayIdx => getCellCode(empId, dateKeys[dayIdx]) === SHIFT_TYPES.REST_WEEKLY);
-    };
-    const hasBreakOffInWeek = (empId, idx) => {
-      const bucket = getWeekBucket(idx);
-      return bucket.some(dayIdx => hasBreakOffCode(getCellCode(empId, dateKeys[dayIdx])));
+      return bucket.some(dayIdx => hasOffCode(getCellCode(empId, dateKeys[dayIdx])));
     };
     const getDailyCoverageCounts = dateKey => {
       let early = 0;
@@ -775,10 +796,13 @@ class Scheduler {
       }
       return { ok: false, reasons: [CandidateFailReason.NOT_EMPTY] };
     };
-    const evaluateRsunCandidate = (empId, idx, options) => {
+    const evaluateRsumCandidate = (empId, idx, options) => {
       const base = evaluateOffCandidate(empId, idx, options);
       if (!base.ok) return base;
-      if (hasRsunInWeek(empId, idx)) return { ok: false, reasons: [CandidateFailReason.WEEK_BUCKET_HAS_RSUN] };
+      const dateKey = dateKeys[idx];
+      if ((dailyRsumCount.get(dateKey) || 0) >= 1) {
+        return { ok: false, reasons: [CandidateFailReason.DAILY_RSUM_LIMIT] };
+      }
       return base;
     };
     const getAdjacentRestBonus = (empId, idx) => {
@@ -813,7 +837,7 @@ class Scheduler {
         if (result.ok) {
           const softReasons = result.softReasons || [];
           const softPenalty = softReasons.length;
-          const bucketBreakOffMissing = !hasBreakOffInWeek(empId, idx);
+          const bucketBreakOffMissing = !hasOffInWeek(empId, idx);
           const adjacentBonus = options.preferAdjacentRest ? getAdjacentRestBonus(empId, idx) : 0;
           candidates.push({
             idx,
@@ -841,7 +865,7 @@ class Scheduler {
       });
       return { candidates, failures };
     };
-    const getRsunCandidates = empId => collectCandidates(empId, evaluateRsunCandidate, {
+    const getRsumCandidates = empId => collectCandidates(empId, evaluateRsumCandidate, {
       allowReplaceWork: true,
       allowReplaceR: true,
       preferWeekBreakOffMissing: true,
@@ -858,7 +882,7 @@ class Scheduler {
       if (!hasBreakOffCode(getCellCode(empId, dateKey))) return false;
       for (let startIdx = 0; startIdx <= windowDays.length - 7; startIdx += 1) {
         const endIdx = startIdx + 6;
-        let count = countBreakOffInRange(empId, startIdx, endIdx);
+        let count = countOffInRange(empId, startIdx, endIdx);
         if (idx >= startIdx && idx <= endIdx) count -= 1;
         if (count <= 0) {
           return false;
@@ -893,10 +917,10 @@ class Scheduler {
       }
       return reasons.length ? { ok: false, reasons } : { ok: true, reasons: [] };
     };
-    const fillRsunQuota = empId => {
-      let remaining = (quotaRemainingByEmp.get(empId) || {}).R_sun || 0;
+    const fillRsumQuota = empId => {
+      let remaining = (quotaRemainingByEmp.get(empId) || {}).R_sum || 0;
       while (remaining > 0) {
-        const { candidates, failures } = getRsunCandidates(empId);
+        const { candidates, failures } = getRsumCandidates(empId);
         let filled = false;
         const attemptFailures = [...failures];
         for (const candidate of candidates) {
@@ -905,15 +929,15 @@ class Scheduler {
             attemptFailures.push({ date: dateKeys[candidate.idx], reasons: precheck.reasons });
             continue;
           }
-          if (replaceCellWithOff(empId, candidate.idx, SHIFT_TYPES.REST_WEEKLY, CELL_STATUS.ASSIGNED, "rsun_fill")) {
+          if (replaceCellWithOff(empId, candidate.idx, SHIFT_TYPES.REST_WEEKLY, CELL_STATUS.ASSIGNED, "rsum_fill")) {
             filled = true;
-            remaining = (quotaRemainingByEmp.get(empId) || {}).R_sun || 0;
+            remaining = (quotaRemainingByEmp.get(empId) || {}).R_sum || 0;
             break;
           }
         }
         if (!filled) {
-          logWarn({ type: "missing_quota", empId, quotaType: "R_sun", remaining });
-          logCandidateFailureSummary(empId, "R_sun", remaining, attemptFailures);
+          logWarn({ type: "missing_quota", empId, quotaType: "R_sum", remaining });
+          logCandidateFailureSummary(empId, "R_sum", remaining, attemptFailures);
           break;
         }
       }
@@ -1005,7 +1029,7 @@ class Scheduler {
     const repairOverQuota = () => {
       for (const person of this.people) {
         const empId = person.empId;
-        let totalR = quotaCountByEmp.get(empId).R_sun || 0;
+        let totalR = quotaCountByEmp.get(empId).R_sum || 0;
         if (totalR > 5) {
           const removable = [];
           for (let idx = 0; idx < windowDays.length; idx += 1) {
@@ -1023,7 +1047,7 @@ class Scheduler {
           }
         }
         if (totalR > 5) {
-          logViolation({ type: "quota_Rsun_over", empId, details: `limit=5 actual=${totalR}` });
+          logViolation({ type: "quota_Rsum_over", empId, details: `limit=5 actual=${totalR}` });
         }
       }
 
@@ -1060,7 +1084,7 @@ class Scheduler {
         }
       }
     };
-    const repairAdjacentRestForRsun = () => {
+    const repairAdjacentRestForRsum = () => {
       for (const person of this.people) {
         const empId = person.empId;
         const remainingR = (quotaRemainingByEmp.get(empId) || {}).r || 0;
@@ -1087,7 +1111,7 @@ class Scheduler {
           for (const candidateIdx of candidateSides) {
             if (!canAssignOff(empId, candidateIdx)) continue;
             if (getOffRemaining(dateKeys[candidateIdx]) <= 0) continue;
-            if (replaceCellWithOff(empId, candidateIdx, SHIFT_TYPES.REST_GENERAL, CELL_STATUS.ASSIGNED, "rsun_adjacent_r")) {
+            if (replaceCellWithOff(empId, candidateIdx, SHIFT_TYPES.REST_GENERAL, CELL_STATUS.ASSIGNED, "rsum_adjacent_r")) {
               break;
             }
           }
@@ -1095,18 +1119,18 @@ class Scheduler {
       }
     };
 
-    // Phase D: fill OFF quotas (R_sun then r), repair, then lock OFF
+    // Phase D: fill OFF quotas (R_sum then r), repair, then lock OFF
     for (const person of this.people) {
-      fillRsunQuota(person.empId);
+      fillRsumQuota(person.empId);
     }
     fillRQuota();
     repairOverQuota();
     for (const person of this.people) {
-      const remainingRsun = (quotaRemainingByEmp.get(person.empId) || {}).R_sun || 0;
-      if (remainingRsun > 0) fillRsunQuota(person.empId);
+      const remainingRsum = (quotaRemainingByEmp.get(person.empId) || {}).R_sum || 0;
+      if (remainingRsum > 0) fillRsumQuota(person.empId);
     }
     fillRQuota();
-    repairAdjacentRestForRsun();
+    repairAdjacentRestForRsum();
     for (const person of this.people) {
       const byDate = plan.get(person.empId);
       const statusByDate = statusPlan.get(person.empId);
@@ -1144,13 +1168,13 @@ class Scheduler {
         const weekIdx = Math.floor(idx / 7);
         const weekStart = weekIdx * 7;
         const weekEnd = weekStart + 6;
-        const aWeekOff = countBreakOffInRange(a, weekStart, weekEnd);
-        const bWeekOff = countBreakOffInRange(b, weekStart, weekEnd);
+        const aWeekOff = countOffInRange(a, weekStart, weekEnd);
+        const bWeekOff = countOffInRange(b, weekStart, weekEnd);
         if (aWeekOff === 0 && bWeekOff > 0) return -1;
         if (bWeekOff === 0 && aWeekOff > 0) return 1;
         const rangeStart = Math.max(0, idx - 6);
-        const aRecentOff = countBreakOffInRange(a, rangeStart, idx) > 0;
-        const bRecentOff = countBreakOffInRange(b, rangeStart, idx) > 0;
+        const aRecentOff = countOffInRange(a, rangeStart, idx) > 0;
+        const bRecentOff = countOffInRange(b, rangeStart, idx) > 0;
         if (aRecentOff && !bRecentOff) return -1;
         if (bRecentOff && !aRecentOff) return 1;
         const aShiftChange = getShiftChangeScore(a, idx, shiftCode);
@@ -1273,9 +1297,11 @@ class Scheduler {
         let nightCount = 0;
         let longNightCount = 0;
         let offCount = 0;
+        let rsumCount = 0;
         for (const person of this.people) {
           const code = plan.get(person.empId).get(dateKey);
           if (hasOffCode(code)) offCount += 1;
+          if (code === SHIFT_TYPES.REST_WEEKLY) rsumCount += 1;
           if (code === coverageShiftCodes.early) earlyCount += 1;
           if (code === coverageShiftCodes.noon) noonCount += 1;
           if (code === coverageShiftCodes.night) nightCount += 1;
@@ -1294,6 +1320,9 @@ class Scheduler {
             availableCount
           });
         }
+        if (rsumCount > 1) {
+          logViolation({ date: dateKey, type: "daily_rsum_limit", details: `count=${rsumCount}` });
+        }
         if (longNightCount >= 1 && nightCount > 0) {
           logViolation({ date: dateKey, type: "night_mutual_exclusion", details: `LN=${longNightCount} N=${nightCount}` });
         }
@@ -1308,33 +1337,16 @@ class Scheduler {
         if (!byDate) continue;
         const weeklyRCount = windowDays.reduce((sum, { dateKey }) => sum + (byDate.get(dateKey) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
         const rCount = windowDays.reduce((sum, { dateKey }) => sum + (byDate.get(dateKey) === SHIFT_TYPES.REST_GENERAL ? 1 : 0), 0);
-        if (weeklyRCount > 5) {
-          logViolation({ empId: person.empId, type: "quota_Rsun", details: `limit=5 actual=${weeklyRCount}` });
+        if (weeklyRCount !== 5) {
+          logViolation({ empId: person.empId, type: "quota_Rsum", details: `limit=5 actual=${weeklyRCount}` });
         }
-        if (rCount > 5) {
+        if (rCount !== 5) {
           logViolation({ empId: person.empId, type: "quota_r", details: `limit=5 actual=${rCount}` });
-        }
-        if (weeklyRCount < 5) {
-          logWarn({ empId: person.empId, type: "quota_Rsun_missing", details: `limit=5 actual=${weeklyRCount}` });
-        }
-        if (rCount < 5) {
-          logWarn({ empId: person.empId, type: "quota_r_missing", details: `limit=5 actual=${rCount}` });
-        }
-
-        for (const bucket of weekBucketsIdx) {
-          const countR = bucket.reduce((sum, idx) => sum + (byDate.get(dateKeys[idx]) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
-          if (countR > 1) {
-            logViolation({ empId: person.empId, type: "weekly_Rsun", details: `weekStart=${dateKeys[bucket[0]]} count=${countR}` });
-          }
-          const countBreakOff = bucket.reduce((sum, idx) => sum + (hasBreakOffCode(byDate.get(dateKeys[idx])) ? 1 : 0), 0);
-          if (countBreakOff === 0) {
-            logViolation({ empId: person.empId, type: "weekly_breakoff_missing", details: `weekStart=${dateKeys[bucket[0]]}` });
-          }
         }
 
         for (let startIdx = 0; startIdx <= windowDays.length - 7; startIdx += 1) {
           const endIdx = startIdx + 6;
-          if (countBreakOffInRange(person.empId, startIdx, endIdx) === 0) {
+          if (countOffInRange(person.empId, startIdx, endIdx) === 0) {
             logViolation({ empId: person.empId, type: "seven_day_off_missing", details: `start=${dateKeys[startIdx]} end=${dateKeys[endIdx]}` });
           }
         }
@@ -1403,41 +1415,21 @@ class Scheduler {
           if (code === SHIFT_TYPES.REST_WEEKLY) weeklyRCount += 1;
           if (code === SHIFT_TYPES.REST_GENERAL) rCount += 1;
         }
-        if (weeklyRCount > 5) {
-          logViolation({ empId: person.empId, type: "quota_Rsun", details: `limit=5 actual=${weeklyRCount}` });
+        if (weeklyRCount !== 5) {
+          logViolation({ empId: person.empId, type: "quota_Rsum", details: `limit=5 actual=${weeklyRCount}` });
           ok = false;
         }
-        if (rCount > 5) {
+        if (rCount !== 5) {
           logViolation({ empId: person.empId, type: "quota_r", details: `limit=5 actual=${rCount}` });
           ok = false;
         }
-        if (weeklyRCount < 5) {
-          logViolation({ empId: person.empId, type: "quota_Rsun_missing", details: `limit=5 actual=${weeklyRCount}` });
-          ok = false;
-        }
-        if (rCount < 5) {
-          logViolation({ empId: person.empId, type: "quota_r_missing", details: `limit=5 actual=${rCount}` });
-          ok = false;
-        }
-        for (const bucket of weekBucketsIdx) {
-          const countR = bucket.reduce((sum, idx) => sum + (byDate.get(dateKeys[idx]) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
-          if (countR > 1) {
-            logViolation({ empId: person.empId, type: "weekly_Rsun", details: `weekStart=${dateKeys[bucket[0]]} count=${countR}` });
-            ok = false;
-          }
-          const countBreakOff = bucket.reduce((sum, idx) => sum + (hasBreakOffCode(byDate.get(dateKeys[idx])) ? 1 : 0), 0);
-          if (countBreakOff === 0) {
-            logViolation({ empId: person.empId, type: "weekly_breakoff_missing", details: `weekStart=${dateKeys[bucket[0]]}` });
-            ok = false;
-          }
-        }
-        const remainingRsun = Math.max(0, 5 - weeklyRCount);
-        if (remainingRsun > 0) {
-          const failures = collectCandidates(person.empId, evaluateRsunCandidate, {
+        const remainingRsum = Math.max(0, 5 - weeklyRCount);
+        if (remainingRsum > 0) {
+          const failures = collectCandidates(person.empId, evaluateRsumCandidate, {
             allowReplaceWork: true,
             allowReplaceR: true
           }).failures;
-          logCandidateFailureSummary(person.empId, "R_sun", remainingRsun, failures);
+          logCandidateFailureSummary(person.empId, "R_sum", remainingRsum, failures);
         }
         const remainingR = Math.max(0, 5 - rCount);
         if (remainingR > 0) {
@@ -1449,7 +1441,7 @@ class Scheduler {
         }
         for (let startIdx = 0; startIdx <= windowDays.length - 7; startIdx += 1) {
           const endIdx = startIdx + 6;
-          if (countBreakOffInRange(person.empId, startIdx, endIdx) === 0) {
+          if (countOffInRange(person.empId, startIdx, endIdx) === 0) {
             logViolation({ empId: person.empId, type: "seven_day_off_missing", details: `start=${dateKeys[startIdx]} end=${dateKeys[endIdx]}` });
             ok = false;
           }
@@ -1464,13 +1456,19 @@ class Scheduler {
       for (const { dateKey } of windowDays) {
         let longNightCount = 0;
         let nightCount = 0;
+        let rsumCount = 0;
         for (const person of this.people) {
           const code = plan.get(person.empId).get(dateKey);
           if (code === coverageShiftCodes.longNight) longNightCount += 1;
           if (code === coverageShiftCodes.night) nightCount += 1;
+          if (code === SHIFT_TYPES.REST_WEEKLY) rsumCount += 1;
         }
         if (longNightCount >= 1 && nightCount > 0) {
           logViolation({ date: dateKey, type: "night_mutual_exclusion", details: `LN=${longNightCount} N=${nightCount}` });
+          ok = false;
+        }
+        if (rsumCount > 1) {
+          logViolation({ date: dateKey, type: "daily_rsum_limit", details: `count=${rsumCount}` });
           ok = false;
         }
       }
