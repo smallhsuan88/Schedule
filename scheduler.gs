@@ -293,6 +293,7 @@ class Scheduler {
       }
       weekBucketsIdx.push(bucket);
     }
+    const dateByKey = new Map(windowDays.map(item => [item.dateKey, item.date]));
 
     const warnings = [];
     const violations = [];
@@ -450,6 +451,16 @@ class Scheduler {
       const totalNeed = demand.early + demand.noon + needNight;
       return Math.max(0, this.people.length - totalNeed);
     };
+    const getOffRemaining = dateKey => {
+      const maxOff = getMaxOff(dateKey);
+      const offCount = dailyOffCount.get(dateKey) || 0;
+      return maxOff - offCount;
+    };
+    const isSundayKey = dateKey => {
+      const dt = dateByKey.get(dateKey);
+      if (!dt) return false;
+      return dt.getDay() === 0;
+    };
 
     const tryAssign = (empId, dateKey, code, status, reason) => {
       const normalized = normalizeShiftCode(code);
@@ -487,6 +498,11 @@ class Scheduler {
       if (!canAssignOff(empId, idx)) return false;
       const dateKey = dateKeys[idx];
       return tryAssign(empId, dateKey, code, status, reason);
+    };
+    const clearCell = (empId, dateKey) => {
+      plan.get(empId).set(dateKey, "");
+      statusPlan.get(empId).set(dateKey, CELL_STATUS.EMPTY);
+      updateOffCount(dateKey);
     };
 
     const applySeedMatrix = (matrix, source) => {
@@ -526,29 +542,39 @@ class Scheduler {
     }
 
     // Phase B: seed from LAST and tally quota
-    const quotaCountByEmp = new Map(this.people.map(p => [p.empId, { R: 0, r: 0 }]));
+    const quotaCountByEmp = new Map(this.people.map(p => [p.empId, { R: 0, R_sun: 0, r: 0 }]));
     for (const person of this.people) {
       const byDate = plan.get(person.empId);
       if (!byDate) continue;
       for (const { dateKey } of windowDays) {
         const code = byDate.get(dateKey);
-        if (code === SHIFT_TYPES.REST_WEEKLY) quotaCountByEmp.get(person.empId).R += 1;
+        if (code === SHIFT_TYPES.REST_WEEKLY) {
+          quotaCountByEmp.get(person.empId).R += 1;
+          if (isSundayKey(dateKey)) quotaCountByEmp.get(person.empId).R_sun += 1;
+        }
         if (code === SHIFT_TYPES.REST_GENERAL) quotaCountByEmp.get(person.empId).r += 1;
       }
     }
     const quotaRemainingByEmp = new Map();
     for (const person of this.people) {
-      const used = quotaCountByEmp.get(person.empId) || { R: 0, r: 0 };
+      const used = quotaCountByEmp.get(person.empId) || { R: 0, R_sun: 0, r: 0 };
       const remaining = {
-        R: Math.max(0, 5 - used.R),
+        R: Math.max(0, 5 - used.R_sun),
         r: Math.max(0, 5 - used.r)
       };
       quotaRemainingByEmp.set(person.empId, remaining);
-      if (used.R > 5 || used.r > 5) {
+      if (used.R > 5 || used.r > 5 || used.R_sun > 5) {
         logViolation({
           type: "quota_exceeded_seeded",
           empId: person.empId,
-          details: `R=${used.R} r=${used.r}`
+          details: `R=${used.R} R_sun=${used.R_sun} r=${used.r}`
+        });
+      }
+      if (used.R > used.R_sun) {
+        logViolation({
+          type: "rsun_non_sunday",
+          empId: person.empId,
+          details: `totalR=${used.R} sundayR=${used.R_sun}`
         });
       }
     }
@@ -605,67 +631,205 @@ class Scheduler {
       }
     }
 
-    const ensureWeeklyR = () => {
+    const getNearestOffDistance = (empId, idx) => {
+      let left = idx - 1;
+      while (left >= 0 && !hasOffCode(getCellCode(empId, dateKeys[left]))) {
+        left -= 1;
+      }
+      let right = idx + 1;
+      while (right < windowDays.length && !hasOffCode(getCellCode(empId, dateKeys[right]))) {
+        right += 1;
+      }
+      const leftDist = left >= 0 ? idx - left : windowDays.length;
+      const rightDist = right < windowDays.length ? right - idx : windowDays.length;
+      return Math.min(leftDist, rightDist);
+    };
+    const canAssignOffWithCap = (empId, idx) => {
+      if (!canAssignOff(empId, idx)) return false;
+      const dateKey = dateKeys[idx];
+      return getOffRemaining(dateKey) > 0;
+    };
+    const getRsunCandidates = empId => {
+      const candidates = [];
+      for (let idx = 0; idx < windowDays.length; idx += 1) {
+        const dateKey = dateKeys[idx];
+        if (!isSundayKey(dateKey)) continue;
+        if (!canAssignOffWithCap(empId, idx)) continue;
+        candidates.push(idx);
+      }
+      candidates.sort((a, b) => {
+        const dateKeyA = dateKeys[a];
+        const dateKeyB = dateKeys[b];
+        const offRemainingDiff = getOffRemaining(dateKeyB) - getOffRemaining(dateKeyA);
+        if (offRemainingDiff !== 0) return offRemainingDiff;
+        const distanceDiff = getNearestOffDistance(empId, b) - getNearestOffDistance(empId, a);
+        if (distanceDiff !== 0) return distanceDiff;
+        return b - a;
+      });
+      return candidates;
+    };
+    const getRCandidates = empId => {
+      const candidates = [];
+      for (let idx = 0; idx < windowDays.length; idx += 1) {
+        const dateKey = dateKeys[idx];
+        if (!canAssignOffWithCap(empId, idx)) continue;
+        candidates.push(idx);
+      }
+      candidates.sort((a, b) => {
+        const dateKeyA = dateKeys[a];
+        const dateKeyB = dateKeys[b];
+        const offRemainingDiff = getOffRemaining(dateKeyB) - getOffRemaining(dateKeyA);
+        if (offRemainingDiff !== 0) return offRemainingDiff;
+        const distanceDiff = getNearestOffDistance(empId, b) - getNearestOffDistance(empId, a);
+        if (distanceDiff !== 0) return distanceDiff;
+        return b - a;
+      });
+      return candidates;
+    };
+    const canRemoveOff = (empId, idx) => {
+      const dateKey = dateKeys[idx];
+      const status = getCellStatus(empId, dateKey);
+      if (status === CELL_STATUS.LOCKED_LEAVE || status === CELL_STATUS.LOCKED_SEED) return false;
+      if (!hasOffCode(getCellCode(empId, dateKey))) return false;
+      for (let startIdx = 0; startIdx <= windowDays.length - 7; startIdx += 1) {
+        const endIdx = startIdx + 6;
+        let count = countOffInRange(empId, startIdx, endIdx);
+        if (idx >= startIdx && idx <= endIdx) count -= 1;
+        if (count <= 0) {
+          return false;
+        }
+      }
+      return true;
+    };
+    const fillRsunQuota = empId => {
+      let remaining = (quotaRemainingByEmp.get(empId) || {}).R || 0;
+      while (remaining > 0) {
+        const candidates = getRsunCandidates(empId);
+        if (!candidates.length) {
+          logWarn({ type: "missing_quota", empId, quotaType: "R_sun", remaining });
+          break;
+        }
+        const idx = candidates[0];
+        if (assignOff(empId, idx, SHIFT_TYPES.REST_WEEKLY, CELL_STATUS.ASSIGNED, "rsun_fill")) {
+          quotaCountByEmp.get(empId).R += 1;
+          quotaCountByEmp.get(empId).R_sun += 1;
+          quotaRemainingByEmp.get(empId).R -= 1;
+          remaining -= 1;
+        } else {
+          logWarn({ type: "missing_quota", empId, quotaType: "R_sun", remaining });
+          break;
+        }
+      }
+    };
+    const fillRQuota = () => {
+      let progress = true;
+      while (progress) {
+        progress = false;
+        for (const person of this.people) {
+          const remaining = (quotaRemainingByEmp.get(person.empId) || {}).r || 0;
+          if (remaining <= 0) continue;
+          const candidates = getRCandidates(person.empId);
+          if (!candidates.length) continue;
+          const idx = candidates[0];
+          if (assignOff(person.empId, idx, SHIFT_TYPES.REST_GENERAL, CELL_STATUS.ASSIGNED, "r_fill")) {
+            quotaCountByEmp.get(person.empId).r += 1;
+            quotaRemainingByEmp.get(person.empId).r -= 1;
+            progress = true;
+          }
+        }
+      }
       for (const person of this.people) {
-        for (const bucket of weekBucketsIdx) {
-          const rCount = bucket.reduce((sum, idx) => sum + (getCellCode(person.empId, dateKeys[idx]) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
-          if (rCount === 1) continue;
-          if (rCount > 1) {
-            logViolation({ type: "weekly_R_exceeded", empId: person.empId, weekStart: dateKeys[bucket[0]], count: rCount });
-            continue;
+        const remaining = (quotaRemainingByEmp.get(person.empId) || {}).r || 0;
+        if (remaining > 0) {
+          logWarn({ type: "missing_quota", empId: person.empId, quotaType: "r", remaining });
+        }
+      }
+    };
+    const repairOverQuota = () => {
+      for (const person of this.people) {
+        const empId = person.empId;
+        let totalR = quotaCountByEmp.get(empId).R || 0;
+        let sundayR = quotaCountByEmp.get(empId).R_sun || 0;
+        if (totalR > 5) {
+          const removable = [];
+          for (let idx = 0; idx < windowDays.length; idx += 1) {
+            const dateKey = dateKeys[idx];
+            if (getCellCode(empId, dateKey) !== SHIFT_TYPES.REST_WEEKLY) continue;
+            if (!canRemoveOff(empId, idx)) continue;
+            removable.push(idx);
           }
-          let placed = false;
-          const sorted = bucket.slice().sort((a, b) => (dailyOffCount.get(dateKeys[a]) || 0) - (dailyOffCount.get(dateKeys[b]) || 0));
-          if ((quotaRemainingByEmp.get(person.empId) || {}).R <= 0) {
-            logWarn({ type: "quota_exhausted", empId: person.empId, quotaType: "R", weekStart: dateKeys[bucket[0]] });
-            continue;
-          }
-          for (const idx of sorted) {
-            if ((quotaRemainingByEmp.get(person.empId) || {}).R <= 0) break;
-            if (assignOff(person.empId, idx, SHIFT_TYPES.REST_WEEKLY, CELL_STATUS.LOCKED_OFF, "weekly_R")) {
-              placed = true;
-              quotaRemainingByEmp.get(person.empId).R -= 1;
-              quotaCountByEmp.get(person.empId).R += 1;
-              break;
+          removable.sort((a, b) => {
+            const aSunday = isSundayKey(dateKeys[a]) ? 1 : 0;
+            const bSunday = isSundayKey(dateKeys[b]) ? 1 : 0;
+            if (aSunday !== bSunday) return aSunday - bSunday;
+            return a - b;
+          });
+          while (totalR > 5 && removable.length) {
+            const idx = removable.shift();
+            const dateKey = dateKeys[idx];
+            const wasSunday = isSundayKey(dateKey);
+            clearCell(empId, dateKey);
+            totalR -= 1;
+            quotaCountByEmp.get(empId).R -= 1;
+            if (wasSunday) {
+              sundayR -= 1;
+              quotaCountByEmp.get(empId).R_sun -= 1;
+              quotaRemainingByEmp.get(empId).R = Math.max(0, 5 - quotaCountByEmp.get(empId).R_sun);
             }
           }
-          if (!placed) {
-            logWarn({ type: "weekly_R_missing", empId: person.empId, weekStart: dateKeys[bucket[0]] });
+        }
+        if (totalR > 5) {
+          logViolation({ type: "quota_R_over", empId, details: `limit=5 actual=${totalR}` });
+        }
+      }
+
+      for (const person of this.people) {
+        const empId = person.empId;
+        let totalR = quotaCountByEmp.get(empId).r || 0;
+        if (totalR > 5) {
+          const removable = [];
+          for (let idx = 0; idx < windowDays.length; idx += 1) {
+            const dateKey = dateKeys[idx];
+            if (getCellCode(empId, dateKey) !== SHIFT_TYPES.REST_GENERAL) continue;
+            if (!canRemoveOff(empId, idx)) continue;
+            removable.push(idx);
+          }
+          removable.sort((a, b) => a - b);
+          while (totalR > 5 && removable.length) {
+            const idx = removable.shift();
+            const dateKey = dateKeys[idx];
+            clearCell(empId, dateKey);
+            totalR -= 1;
+            quotaCountByEmp.get(empId).r -= 1;
+            quotaRemainingByEmp.get(empId).r = Math.max(0, 5 - quotaCountByEmp.get(empId).r);
           }
         }
+        if (totalR > 5) {
+          logViolation({ type: "quota_r_over", empId, details: `limit=5 actual=${totalR}` });
+        }
       }
     };
 
-    const assignQuotaOff = (person, type) => {
-      const remaining = (quotaRemainingByEmp.get(person.empId) || {})[type];
-      if (remaining <= 0) return;
-      const candidateIdx = windowDays.map((_, idx) => idx);
-      candidateIdx.sort((a, b) => (dailyOffCount.get(dateKeys[a]) || 0) - (dailyOffCount.get(dateKeys[b]) || 0));
-      let toAssign = remaining;
-      const code = type === "R" ? SHIFT_TYPES.REST_WEEKLY : SHIFT_TYPES.REST_GENERAL;
-      for (const idx of candidateIdx) {
-        if (toAssign <= 0) break;
-        if (type === "R") {
-          const weekIdx = Math.floor(idx / 7);
-          const bucket = weekBucketsIdx[weekIdx] || [];
-          const hasR = bucket.some(bucketIdx => getCellCode(person.empId, dateKeys[bucketIdx]) === SHIFT_TYPES.REST_WEEKLY);
-          if (hasR) continue;
-        }
-        if (assignOff(person.empId, idx, code, CELL_STATUS.LOCKED_OFF, "quota_off")) {
-          quotaCountByEmp.get(person.empId)[type] += 1;
-          quotaRemainingByEmp.get(person.empId)[type] -= 1;
-          toAssign -= 1;
-        }
-      }
-      if (toAssign > 0) {
-        logWarn({ type: "missing_quota", empId: person.empId, quotaType: type, remaining: toAssign });
-      }
-    };
-
-    // Phase D: fill OFF quotas (weekly R, then r)
-    ensureWeeklyR();
+    // Phase D: fill OFF quotas (R_sun then r), repair, then lock OFF
     for (const person of this.people) {
-      assignQuotaOff(person, "r");
+      fillRsunQuota(person.empId);
+    }
+    fillRQuota();
+    repairOverQuota();
+    fillRQuota();
+    for (const person of this.people) {
+      fillRsunQuota(person.empId);
+    }
+    for (const person of this.people) {
+      const byDate = plan.get(person.empId);
+      const statusByDate = statusPlan.get(person.empId);
+      if (!byDate || !statusByDate) continue;
+      for (const { dateKey } of windowDays) {
+        if (!hasOffCode(byDate.get(dateKey))) continue;
+        const status = statusByDate.get(dateKey);
+        if (status === CELL_STATUS.LOCKED_LEAVE || status === CELL_STATUS.LOCKED_SEED) continue;
+        statusByDate.set(dateKey, CELL_STATUS.LOCKED_OFF);
+      }
     }
 
     // Phase E: assign long night LN
@@ -856,6 +1020,10 @@ class Scheduler {
         const byDate = plan.get(person.empId);
         if (!byDate) continue;
         const weeklyRCount = windowDays.reduce((sum, { dateKey }) => sum + (byDate.get(dateKey) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
+        const sundayRCount = windowDays.reduce((sum, { dateKey }) => {
+          if (byDate.get(dateKey) === SHIFT_TYPES.REST_WEEKLY && isSundayKey(dateKey)) return sum + 1;
+          return sum;
+        }, 0);
         const rCount = windowDays.reduce((sum, { dateKey }) => sum + (byDate.get(dateKey) === SHIFT_TYPES.REST_GENERAL ? 1 : 0), 0);
         if (weeklyRCount > 5) {
           logViolation({ empId: person.empId, type: "quota_R", details: `limit=5 actual=${weeklyRCount}` });
@@ -863,11 +1031,27 @@ class Scheduler {
         if (rCount > 5) {
           logViolation({ empId: person.empId, type: "quota_r", details: `limit=5 actual=${rCount}` });
         }
+        if (sundayRCount < 5) {
+          logWarn({ empId: person.empId, type: "quota_R_missing", details: `limit=5 actual=${sundayRCount}` });
+        }
+        if (rCount < 5) {
+          logWarn({ empId: person.empId, type: "quota_r_missing", details: `limit=5 actual=${rCount}` });
+        }
 
         for (const bucket of weekBucketsIdx) {
           const countR = bucket.reduce((sum, idx) => sum + (byDate.get(dateKeys[idx]) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
           if (countR !== 1) {
-            logViolation({ empId: person.empId, type: "weekly_R", details: `weekStart=${dateKeys[bucket[0]]} count=${countR}` });
+            if (countR > 1) {
+              logViolation({ empId: person.empId, type: "weekly_R", details: `weekStart=${dateKeys[bucket[0]]} count=${countR}` });
+            } else {
+              logWarn({ empId: person.empId, type: "weekly_R_missing", details: `weekStart=${dateKeys[bucket[0]]} count=${countR}` });
+            }
+          }
+        }
+        for (const { dateKey } of windowDays) {
+          const code = byDate.get(dateKey);
+          if (code === SHIFT_TYPES.REST_WEEKLY && !isSundayKey(dateKey)) {
+            logViolation({ empId: person.empId, type: "rsun_non_sunday", details: `date=${dateKey}` });
           }
         }
 
@@ -915,17 +1099,30 @@ class Scheduler {
         const byDate = plan.get(person.empId);
         if (!byDate) continue;
         let weeklyRCount = 0;
+        let sundayRCount = 0;
         let rCount = 0;
         for (const { dateKey } of windowDays) {
           const code = byDate.get(dateKey);
           if (!code) continue;
+          if (typeof code === "string") {
+            const normalized = String(code).normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+            if (normalized.includes("+") || normalized.split(/\s+/).filter(Boolean).length > 1) {
+              logViolation({ type: "daily_single_assignment", empId: person.empId, date: dateKey, code });
+              ok = false;
+            }
+          }
           const normalized = normalizeShiftCode(code);
           if (normalized === "INVALID_MULTI_SHIFT" || normalized === "INVALID_SHIFT") {
             logViolation({ type: "invalid_shift_code", empId: person.empId, date: dateKey, code });
             ok = false;
           }
           if (code === SHIFT_TYPES.REST_WEEKLY) weeklyRCount += 1;
+          if (code === SHIFT_TYPES.REST_WEEKLY && isSundayKey(dateKey)) sundayRCount += 1;
           if (code === SHIFT_TYPES.REST_GENERAL) rCount += 1;
+          if (code === SHIFT_TYPES.REST_WEEKLY && !isSundayKey(dateKey)) {
+            logViolation({ empId: person.empId, type: "rsun_non_sunday", details: `date=${dateKey}` });
+            ok = false;
+          }
         }
         if (weeklyRCount > 5) {
           logViolation({ empId: person.empId, type: "quota_R", details: `limit=5 actual=${weeklyRCount}` });
@@ -935,11 +1132,21 @@ class Scheduler {
           logViolation({ empId: person.empId, type: "quota_r", details: `limit=5 actual=${rCount}` });
           ok = false;
         }
+        if (sundayRCount < 5) {
+          logWarn({ empId: person.empId, type: "quota_R_missing", details: `limit=5 actual=${sundayRCount}` });
+        }
+        if (rCount < 5) {
+          logWarn({ empId: person.empId, type: "quota_r_missing", details: `limit=5 actual=${rCount}` });
+        }
         for (const bucket of weekBucketsIdx) {
           const countR = bucket.reduce((sum, idx) => sum + (byDate.get(dateKeys[idx]) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
           if (countR !== 1) {
-            logViolation({ empId: person.empId, type: "weekly_R", details: `weekStart=${dateKeys[bucket[0]]} count=${countR}` });
-            ok = false;
+            if (countR > 1) {
+              logViolation({ empId: person.empId, type: "weekly_R", details: `weekStart=${dateKeys[bucket[0]]} count=${countR}` });
+              ok = false;
+            } else {
+              logWarn({ empId: person.empId, type: "weekly_R_missing", details: `weekStart=${dateKeys[bucket[0]]} count=${countR}` });
+            }
           }
         }
         for (let startIdx = 0; startIdx <= windowDays.length - 7; startIdx += 1) {
