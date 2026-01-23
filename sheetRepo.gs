@@ -84,25 +84,64 @@ class SheetRepo {
     const sh = this.ss.getSheetByName("Schedule") || this.ss.insertSheet("Schedule");
     sh.clearContents();
     const headers = ["date","shiftCode","empId","status"];
-    sh.getRange(1,1,1,headers.length).setValues([headers]);
-    const data = rows.map(r => [r.date, r.shiftCode, r.empId, r.status]);
-    if (data.length) sh.getRange(2,1,data.length,headers.length).setValues(data);
+    for (let c = 0; c < headers.length; c += 1) {
+      sh.getRange(1, c + 1).setValue(headers[c]);
+    }
+    for (let r = 0; r < rows.length; r += 1) {
+      const row = rows[r];
+      const values = [row.date, row.shiftCode, row.empId, row.status];
+      for (let c = 0; c < values.length; c += 1) {
+        sh.getRange(r + 2, c + 1).setValue(values[c]);
+      }
+    }
   }
 
   writeMonthSchedule(matrix, headers){
     const sh = this.ss.getSheetByName("MonthSchedule") || this.ss.insertSheet("MonthSchedule");
-    sh.clearContents();
     const headerRows = Array.isArray(headers[0]) ? headers : [headers];
-    sh.getRange(1, 1, headerRows.length, headerRows[0].length).setValues(headerRows);
-    if (matrix.length) sh.getRange(1 + headerRows.length, 1, matrix.length, headerRows[0].length).setValues(matrix);
+    const totalRows = headerRows.length + matrix.length;
+    const totalCols = headerRows[0].length;
+    const existingValues = sh.getRange(1, 1, totalRows, totalCols).getValues();
+
+    for (let r = 0; r < headerRows.length; r += 1) {
+      for (let c = 0; c < headerRows[r].length; c += 1) {
+        sh.getRange(r + 1, c + 1).setValue(headerRows[r][c]);
+      }
+    }
+
+    for (let r = 0; r < matrix.length; r += 1) {
+      for (let c = 0; c < matrix[r].length; c += 1) {
+        const targetRow = r + headerRows.length;
+        const existing = existingValues[targetRow][c];
+        if (existing === "" || existing === null) {
+          sh.getRange(targetRow + 1, c + 1).setValue(matrix[r][c]);
+        }
+      }
+    }
   }
 
   writeLastSchedule(matrix, headers){
     const sh = this.ss.getSheetByName("LAST") || this.ss.insertSheet("LAST");
-    sh.clearContents();
     const headerRows = Array.isArray(headers[0]) ? headers : [headers];
-    sh.getRange(1, 1, headerRows.length, headerRows[0].length).setValues(headerRows);
-    if (matrix.length) sh.getRange(1 + headerRows.length, 1, matrix.length, headerRows[0].length).setValues(matrix);
+    const totalRows = headerRows.length + matrix.length;
+    const totalCols = headerRows[0].length;
+    const existingValues = sh.getRange(1, 1, totalRows, totalCols).getValues();
+
+    for (let r = 0; r < headerRows.length; r += 1) {
+      for (let c = 0; c < headerRows[r].length; c += 1) {
+        sh.getRange(r + 1, c + 1).setValue(headerRows[r][c]);
+      }
+    }
+
+    for (let r = 0; r < matrix.length; r += 1) {
+      for (let c = 0; c < matrix[r].length; c += 1) {
+        const targetRow = r + headerRows.length;
+        const existing = existingValues[targetRow][c];
+        if (existing === "" || existing === null) {
+          sh.getRange(targetRow + 1, c + 1).setValue(matrix[r][c]);
+        }
+      }
+    }
   }
 
   getLastSchedule(windowStartDate, windowEndDate){

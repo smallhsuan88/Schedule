@@ -154,7 +154,6 @@ class Scheduler {
     // Phase 0: calendar structure (window-based)
     const calendarDates = windowDays.map(({ date }) => date);
     const dateKeys = windowDays.map(({ dateKey }) => dateKey);
-    const dow = calendarDates.map(date => dow_(date));
     const dayIndex = new Map(windowDays.map((item, idx) => [item.dateKey, idx]));
 
     const shiftByCode = new Map(Object.values(this.shiftDefs).map(def => [def.shiftCode, def]));
@@ -165,7 +164,7 @@ class Scheduler {
       NIGHT: "N",
       LONG_NIGHT: "LN",
       OFF: "OFF",
-      REST_SUN: "R_sun",
+      REST_WEEKLY: "R",
       REST_GENERAL: "r"
     });
 
@@ -223,16 +222,20 @@ class Scheduler {
     };
 
     const allowedShiftCodes = new Set([
-      SHIFT_TYPES.REST_SUN,
+      SHIFT_TYPES.REST_WEEKLY,
       SHIFT_TYPES.REST_GENERAL,
       ...shiftByCode.keys()
     ]);
+    for (const leaveType of leaveTypes) {
+      if (leaveType) allowedShiftCodes.add(String(leaveType).normalize("NFKC").trim());
+    }
     if (shiftByCode.has("特") || leaveTypes.has("特")) allowedShiftCodes.add("特");
     if (shiftByCode.has("補") || leaveTypes.has("補")) allowedShiftCodes.add("補");
+    if (shiftByCode.has("師") || leaveTypes.has("師")) allowedShiftCodes.add("師");
 
     const normalizeShiftCode = raw => {
       if (raw === null || raw === undefined) return "";
-      const rawStr = String(raw).trim();
+      const rawStr = String(raw).normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
       if (!rawStr) return "";
       if (rawStr.includes("+")) return "INVALID_MULTI_SHIFT";
       const tokens = rawStr.split(/\s+/).filter(Boolean);
@@ -242,27 +245,24 @@ class Scheduler {
       return code;
     };
 
-    const normalizeSeedCode = (dateKey, code) => {
+    const normalizeSeedCode = code => {
       if (!code) return "";
-      if (code === SHIFT_TYPES.REST_SUN || code === SHIFT_TYPES.REST_GENERAL) return code;
-      if (code === "R_sun" || code === "R_sat") return SHIFT_TYPES.REST_SUN;
-      if (code === "R") {
-        const idx = dayIndex.get(dateKey);
-        if (idx !== undefined && dow[idx] === 0) return SHIFT_TYPES.REST_SUN;
-        return SHIFT_TYPES.REST_GENERAL;
-      }
-      return code;
+      const rawStr = String(code).normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+      if (!rawStr) return "";
+      if (rawStr === "R_sun" || rawStr === "R_sat") return SHIFT_TYPES.REST_WEEKLY;
+      if (rawStr === "R") return SHIFT_TYPES.REST_WEEKLY;
+      return rawStr;
     };
 
     const isLeaveCode_ = code => {
       if (!code) return false;
-      if (code === SHIFT_TYPES.REST_SUN || code === SHIFT_TYPES.REST_GENERAL) return false;
+      if (code === SHIFT_TYPES.REST_WEEKLY || code === SHIFT_TYPES.REST_GENERAL) return false;
       if (code === coverageShiftCodes.early || code === coverageShiftCodes.noon || code === coverageShiftCodes.night || code === coverageShiftCodes.longNight) {
         return false;
       }
       return allowedShiftCodes.has(code) && !shiftByCode.has(code);
     };
-    const isOffCode = code => code === SHIFT_TYPES.REST_SUN || code === SHIFT_TYPES.REST_GENERAL || isLeaveCode_(code);
+    const isOffCode = code => code === SHIFT_TYPES.REST_WEEKLY || code === SHIFT_TYPES.REST_GENERAL || isLeaveCode_(code);
     const isWorkCode = code => Boolean(code) && !isOffCode(code);
     const isNightCode_ = code => code === coverageShiftCodes.night || code === coverageShiftCodes.longNight || String(code || "").includes("常夜");
     const isEarlyCode_ = code => code === "早" || code === "早L";
@@ -288,12 +288,6 @@ class Scheduler {
         bucket.push(w * 7 + d);
       }
       weekBucketsIdx.push(bucket);
-    }
-
-    const sundayIdx = [];
-    for (let idx = 0; idx < windowDays.length; idx += 1) {
-      const dayOfWeek = dow[idx];
-      if (dayOfWeek === 0) sundayIdx.push(idx);
     }
 
     const warnings = [];
@@ -325,30 +319,11 @@ class Scheduler {
     const defaultDemand = { early: 1, noon: 1, night: 1, total: 3 };
     const getDailyDemand = dateKey => demandByDate.get(dateKey) || defaultDemand;
 
-    const quotaByEmp = new Map(this.people.map(p => [p.empId, { quotaSun: 5, quotaOffTotal: 10 }]));
-
     const dailyLeaveCounts = new Map();
     for (let idx = 0; idx < windowDays.length; idx += 1) {
       const dateKey = dateKeys[idx];
       const leaveCount = this.leave.filter(item => fmtDate(item.date) === dateKey).length;
       dailyLeaveCounts.set(dateKey, leaveCount);
-    }
-
-    const dailyOffCap = new Map();
-    for (let idx = 0; idx < windowDays.length; idx += 1) {
-      const dateKey = dateKeys[idx];
-      const demand = getDailyDemand(dateKey);
-      const needNTotal = demand.night;
-      const totalNeed = demand.early + demand.noon + needNTotal;
-      const maxOff = Math.max(0, this.people.length - totalNeed);
-      dailyOffCap.set(dateKey, maxOff);
-      if (this.people.length < totalNeed) {
-        logWarn({ type: "coverage_insufficient_staff", date: dateKey, totalNeed, totalStaff: this.people.length });
-      }
-      const leaveCount = dailyLeaveCounts.get(dateKey) || 0;
-      if (leaveCount > maxOff) {
-        logWarn({ type: "off_cap_exceeded_by_leave", date: dateKey, leaveCount, maxOff });
-      }
     }
 
     const getCellCode = (empId, dateKey) => plan.get(empId).get(dateKey) || "";
@@ -408,6 +383,7 @@ class Scheduler {
       if (shiftCode === coverageShiftCodes.longNight && !fixedNightEmpSet.has(empId)) return false;
       if (shiftCode === coverageShiftCodes.night && (dailyLongNightCount.get(dateKey) || 0) >= 1) return false;
       if (!minRestOk(empId, idx, shiftCode)) return false;
+      if (!hasSevenDayOffCoverage(empId, idx)) return false;
       return true;
     };
 
@@ -429,6 +405,18 @@ class Scheduler {
       return count;
     };
 
+    const hasSevenDayOffCoverage = (empId, idx) => {
+      const start = Math.max(0, idx - 6);
+      const end = Math.min(idx, windowDays.length - 7);
+      for (let startIdx = start; startIdx <= end; startIdx += 1) {
+        const endIdx = startIdx + 6;
+        if (countOffInRange(empId, startIdx, endIdx) === 0) {
+          return false;
+        }
+      }
+      return true;
+    };
+
     const dailyOffCount = new Map(windowDays.map(item => [item.dateKey, 0]));
 
     const updateOffCount = dateKey => {
@@ -441,6 +429,13 @@ class Scheduler {
     };
 
     const dailyLongNightCount = new Map(windowDays.map(item => [item.dateKey, 0]));
+    const getMaxOff = dateKey => {
+      const demand = getDailyDemand(dateKey);
+      const longNightCount = dailyLongNightCount.get(dateKey) || 0;
+      const needNight = Math.max(0, demand.night - longNightCount);
+      const totalNeed = demand.early + demand.noon + needNight;
+      return Math.max(0, this.people.length - totalNeed);
+    };
 
     const tryAssign = (empId, dateKey, code, status, reason) => {
       const normalized = normalizeShiftCode(code);
@@ -465,6 +460,11 @@ class Scheduler {
       }
       if (hasOffCode(normalized)) {
         updateOffCount(dateKey);
+        const maxOff = getMaxOff(dateKey);
+        const offCount = dailyOffCount.get(dateKey) || 0;
+        if (offCount > maxOff) {
+          logWarn({ type: "off_cap_exceeded", date: dateKey, offCount, maxOff });
+        }
       }
       return true;
     };
@@ -482,7 +482,7 @@ class Scheduler {
         if (!byDate) continue;
         for (const [dateKey, rawCode] of byDateSeed.entries()) {
           if (!byDate.has(dateKey)) continue;
-          const normalized = normalizeSeedCode(dateKey, rawCode);
+          const normalized = normalizeSeedCode(rawCode);
           if (!normalized) continue;
           const result = normalizeShiftCode(normalized);
           if (result === "INVALID_MULTI_SHIFT" || result === "INVALID_SHIFT") {
@@ -518,7 +518,7 @@ class Scheduler {
       if (!byDate) continue;
       for (const { dateKey } of windowDays) {
         const code = byDate.get(dateKey);
-        if (code === SHIFT_TYPES.REST_SUN) quotaCountByEmp.get(person.empId).R += 1;
+        if (code === SHIFT_TYPES.REST_WEEKLY) quotaCountByEmp.get(person.empId).R += 1;
         if (code === SHIFT_TYPES.REST_GENERAL) quotaCountByEmp.get(person.empId).r += 1;
       }
     }
@@ -534,7 +534,7 @@ class Scheduler {
         logViolation({
           type: "quota_exceeded_seeded",
           empId: person.empId,
-          details: `R_sun=${used.R} r=${used.r}`
+          details: `R=${used.R} r=${used.r}`
         });
       }
     }
@@ -575,61 +575,72 @@ class Scheduler {
     for (let idx = 0; idx < windowDays.length; idx += 1) {
       const dateKey = dateKeys[idx];
       updateOffCount(dateKey);
-      const maxOff = dailyOffCap.get(dateKey) || 0;
+      const demand = getDailyDemand(dateKey);
+      const totalNeed = demand.early + demand.noon + demand.night;
+      if (this.people.length < totalNeed) {
+        logWarn({ type: "coverage_insufficient_staff", date: dateKey, totalNeed, totalStaff: this.people.length });
+      }
+      const maxOff = getMaxOff(dateKey);
       const offCount = dailyOffCount.get(dateKey) || 0;
       if (offCount > maxOff) {
         logWarn({ type: "off_cap_exceeded_by_seed", date: dateKey, offCount, maxOff });
       }
+      const leaveCount = dailyLeaveCounts.get(dateKey) || 0;
+      if (leaveCount > maxOff) {
+        logWarn({ type: "off_cap_exceeded_by_leave", date: dateKey, leaveCount, maxOff });
+      }
     }
 
-    const ensureWeeklyOff = () => {
+    const ensureWeeklyR = () => {
       for (const person of this.people) {
         for (const bucket of weekBucketsIdx) {
-          const hasOff = bucket.some(idx => hasOffCode(getCellCode(person.empId, dateKeys[idx])));
-          if (hasOff) continue;
-          const sorted = bucket.slice().sort((a, b) => (dailyOffCount.get(dateKeys[a]) || 0) - (dailyOffCount.get(dateKeys[b]) || 0));
+          const rCount = bucket.reduce((sum, idx) => sum + (getCellCode(person.empId, dateKeys[idx]) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
+          if (rCount === 1) continue;
+          if (rCount > 1) {
+            logViolation({ type: "weekly_R_exceeded", empId: person.empId, weekStart: dateKeys[bucket[0]], count: rCount });
+            continue;
+          }
           let placed = false;
-          if ((quotaRemainingByEmp.get(person.empId) || {}).r <= 0) {
-            logWarn({ type: "quota_exhausted", empId: person.empId, quotaType: "r", weekStart: dateKeys[bucket[0]] });
+          const sorted = bucket.slice().sort((a, b) => (dailyOffCount.get(dateKeys[a]) || 0) - (dailyOffCount.get(dateKeys[b]) || 0));
+          if ((quotaRemainingByEmp.get(person.empId) || {}).R <= 0) {
+            logWarn({ type: "quota_exhausted", empId: person.empId, quotaType: "R", weekStart: dateKeys[bucket[0]] });
             continue;
           }
           for (const idx of sorted) {
-            if ((quotaRemainingByEmp.get(person.empId) || {}).r <= 0) break;
-            if (assignOff(person.empId, idx, SHIFT_TYPES.REST_GENERAL, CELL_STATUS.LOCKED_OFF, "weekly_off")) {
+            if ((quotaRemainingByEmp.get(person.empId) || {}).R <= 0) break;
+            if (assignOff(person.empId, idx, SHIFT_TYPES.REST_WEEKLY, CELL_STATUS.LOCKED_OFF, "weekly_R")) {
               placed = true;
-              quotaRemainingByEmp.get(person.empId).r -= 1;
-              quotaCountByEmp.get(person.empId).r += 1;
+              quotaRemainingByEmp.get(person.empId).R -= 1;
+              quotaCountByEmp.get(person.empId).R += 1;
               break;
             }
           }
           if (!placed) {
-            logWarn({ type: "weekly_off_missing", empId: person.empId, weekStart: dateKeys[bucket[0]] });
+            logWarn({ type: "weekly_R_missing", empId: person.empId, weekStart: dateKeys[bucket[0]] });
           }
         }
       }
     };
 
-    const assignQuotaOff = (person, type, targets) => {
+    const assignQuotaOff = (person, type) => {
       const remaining = (quotaRemainingByEmp.get(person.empId) || {})[type];
       if (remaining <= 0) return;
-      const candidateIdx = type === "R"
-        ? sundayIdx.slice()
-        : windowDays.map((_, idx) => idx);
+      const candidateIdx = windowDays.map((_, idx) => idx);
       candidateIdx.sort((a, b) => (dailyOffCount.get(dateKeys[a]) || 0) - (dailyOffCount.get(dateKeys[b]) || 0));
       let toAssign = remaining;
+      const code = type === "R" ? SHIFT_TYPES.REST_WEEKLY : SHIFT_TYPES.REST_GENERAL;
       for (const idx of candidateIdx) {
         if (toAssign <= 0) break;
-        if (type === "R" && dow[idx] !== 0) continue;
-        const code = type === "R" ? SHIFT_TYPES.REST_SUN : SHIFT_TYPES.REST_GENERAL;
+        if (type === "R") {
+          const weekIdx = Math.floor(idx / 7);
+          const bucket = weekBucketsIdx[weekIdx] || [];
+          const hasR = bucket.some(bucketIdx => getCellCode(person.empId, dateKeys[bucketIdx]) === SHIFT_TYPES.REST_WEEKLY);
+          if (hasR) continue;
+        }
         if (assignOff(person.empId, idx, code, CELL_STATUS.LOCKED_OFF, "quota_off")) {
           quotaCountByEmp.get(person.empId)[type] += 1;
           quotaRemainingByEmp.get(person.empId)[type] -= 1;
           toAssign -= 1;
-          const maxOff = dailyOffCap.get(dateKeys[idx]) || 0;
-          const offCount = dailyOffCount.get(dateKeys[idx]) || 0;
-          if (offCount > maxOff) {
-            logWarn({ type: "off_cap_exceeded", date: dateKeys[idx], offCount, maxOff });
-          }
         }
       }
       if (toAssign > 0) {
@@ -637,13 +648,10 @@ class Scheduler {
       }
     };
 
-    // Phase D: fill OFF quotas (weekly, R, r)
-    ensureWeeklyOff();
+    // Phase D: fill OFF quotas (weekly R, then r)
+    ensureWeeklyR();
     for (const person of this.people) {
-      assignQuotaOff(person, "R", 5);
-    }
-    for (const person of this.people) {
-      assignQuotaOff(person, "r", 5);
+      assignQuotaOff(person, "r");
     }
 
     // Phase E: assign long night LN
@@ -821,7 +829,7 @@ class Scheduler {
         if (longNightCount >= 1 && nightCount > 0) {
           logViolation({ date: dateKey, type: "night_mutual_exclusion", details: `LN=${longNightCount} N=${nightCount}` });
         }
-        const maxOff = dailyOffCap.get(dateKey) || 0;
+        const maxOff = getMaxOff(dateKey);
         if (offCount > maxOff) {
           logWarn({ date: dateKey, type: "off_cap_exceeded", offCount, maxOff });
         }
@@ -830,24 +838,26 @@ class Scheduler {
       for (const person of this.people) {
         const byDate = plan.get(person.empId);
         if (!byDate) continue;
-        const quota = quotaByEmp.get(person.empId) || { quotaSun: 5, quotaOffTotal: 10 };
-        const sunCount = sundayIdx.reduce((sum, idx) => sum + (byDate.get(dateKeys[idx]) === SHIFT_TYPES.REST_SUN ? 1 : 0), 0);
-        const offTotal = windowDays.reduce((sum, { dateKey }) => sum + (hasOffCode(byDate.get(dateKey)) ? 1 : 0), 0);
+        const weeklyRCount = windowDays.reduce((sum, { dateKey }) => sum + (byDate.get(dateKey) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
         const rCount = windowDays.reduce((sum, { dateKey }) => sum + (byDate.get(dateKey) === SHIFT_TYPES.REST_GENERAL ? 1 : 0), 0);
-        if (sunCount > 5) {
-          logViolation({ empId: person.empId, type: "quota_sun", details: `limit=5 actual=${sunCount}` });
+        if (weeklyRCount > 5) {
+          logViolation({ empId: person.empId, type: "quota_R", details: `limit=5 actual=${weeklyRCount}` });
         }
         if (rCount > 5) {
           logViolation({ empId: person.empId, type: "quota_r", details: `limit=5 actual=${rCount}` });
         }
-        if (offTotal < quota.quotaOffTotal) {
-          logViolation({ empId: person.empId, type: "quota_off_total", details: `target=${quota.quotaOffTotal} actual=${offTotal}` });
-        }
 
         for (const bucket of weekBucketsIdx) {
-          const hasOff = bucket.some(idx => hasOffCode(byDate.get(dateKeys[idx])));
-          if (!hasOff) {
-            logViolation({ empId: person.empId, type: "weekly_off_missing", details: `weekStart=${dateKeys[bucket[0]]}` });
+          const countR = bucket.reduce((sum, idx) => sum + (byDate.get(dateKeys[idx]) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
+          if (countR !== 1) {
+            logViolation({ empId: person.empId, type: "weekly_R", details: `weekStart=${dateKeys[bucket[0]]} count=${countR}` });
+          }
+        }
+
+        for (let startIdx = 0; startIdx <= windowDays.length - 7; startIdx += 1) {
+          const endIdx = startIdx + 6;
+          if (countOffInRange(person.empId, startIdx, endIdx) === 0) {
+            logViolation({ empId: person.empId, type: "seven_day_off_missing", details: `start=${dateKeys[startIdx]} end=${dateKeys[endIdx]}` });
           }
         }
 
@@ -887,7 +897,7 @@ class Scheduler {
       for (const person of this.people) {
         const byDate = plan.get(person.empId);
         if (!byDate) continue;
-        let sunCount = 0;
+        let weeklyRCount = 0;
         let rCount = 0;
         for (const { dateKey } of windowDays) {
           const code = byDate.get(dateKey);
@@ -897,16 +907,30 @@ class Scheduler {
             logViolation({ type: "invalid_shift_code", empId: person.empId, date: dateKey, code });
             ok = false;
           }
-          if (code === SHIFT_TYPES.REST_SUN) sunCount += 1;
+          if (code === SHIFT_TYPES.REST_WEEKLY) weeklyRCount += 1;
           if (code === SHIFT_TYPES.REST_GENERAL) rCount += 1;
         }
-        if (sunCount > 5) {
-          logViolation({ empId: person.empId, type: "quota_sun", details: `limit=5 actual=${sunCount}` });
+        if (weeklyRCount > 5) {
+          logViolation({ empId: person.empId, type: "quota_R", details: `limit=5 actual=${weeklyRCount}` });
           ok = false;
         }
         if (rCount > 5) {
           logViolation({ empId: person.empId, type: "quota_r", details: `limit=5 actual=${rCount}` });
           ok = false;
+        }
+        for (const bucket of weekBucketsIdx) {
+          const countR = bucket.reduce((sum, idx) => sum + (byDate.get(dateKeys[idx]) === SHIFT_TYPES.REST_WEEKLY ? 1 : 0), 0);
+          if (countR !== 1) {
+            logViolation({ empId: person.empId, type: "weekly_R", details: `weekStart=${dateKeys[bucket[0]]} count=${countR}` });
+            ok = false;
+          }
+        }
+        for (let startIdx = 0; startIdx <= windowDays.length - 7; startIdx += 1) {
+          const endIdx = startIdx + 6;
+          if (countOffInRange(person.empId, startIdx, endIdx) === 0) {
+            logViolation({ empId: person.empId, type: "seven_day_off_missing", details: `start=${dateKeys[startIdx]} end=${dateKeys[endIdx]}` });
+            ok = false;
+          }
         }
       }
 
