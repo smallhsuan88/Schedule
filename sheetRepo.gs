@@ -82,18 +82,11 @@ class SheetRepo {
 
   writeSchedule(rows){
     const sh = this.ss.getSheetByName("Schedule") || this.ss.insertSheet("Schedule");
-    sh.clearContents();
     const headers = ["date","shiftCode","empId","status"];
-    for (let c = 0; c < headers.length; c += 1) {
-      sh.getRange(1, c + 1).setValue(headers[c]);
-    }
-    for (let r = 0; r < rows.length; r += 1) {
-      const row = rows[r];
-      const values = [row.date, row.shiftCode, row.empId, row.status];
-      for (let c = 0; c < values.length; c += 1) {
-        sh.getRange(r + 2, c + 1).setValue(values[c]);
-      }
-    }
+    const values = [headers, ...rows.map(row => [row.date, row.shiftCode, row.empId, row.status])];
+    const targetRange = sh.getRange(1, 1, values.length, headers.length);
+    targetRange.clearContent();
+    targetRange.setValues(values);
   }
 
   writeMonthSchedule(matrix, headers){
@@ -101,23 +94,11 @@ class SheetRepo {
     const headerRows = Array.isArray(headers[0]) ? headers : [headers];
     const totalRows = headerRows.length + matrix.length;
     const totalCols = headerRows[0].length;
-    const existingValues = sh.getRange(1, 1, totalRows, totalCols).getValues();
-
-    for (let r = 0; r < headerRows.length; r += 1) {
-      for (let c = 0; c < headerRows[r].length; c += 1) {
-        sh.getRange(r + 1, c + 1).setValue(headerRows[r][c]);
-      }
-    }
-
-    for (let r = 0; r < matrix.length; r += 1) {
-      for (let c = 0; c < matrix[r].length; c += 1) {
-        const targetRow = r + headerRows.length;
-        const existing = existingValues[targetRow][c];
-        if (existing === "" || existing === null) {
-          sh.getRange(targetRow + 1, c + 1).setValue(matrix[r][c]);
-        }
-      }
-    }
+    const values = headerRows.concat(matrix);
+    const targetRange = sh.getRange(1, 1, totalRows, totalCols);
+    targetRange.clearContent();
+    this.validateRangeValues_(targetRange, values, "MonthSchedule");
+    targetRange.setValues(values);
   }
 
   writeLastSchedule(matrix, headers){
@@ -246,5 +227,59 @@ class SheetRepo {
       headers.forEach((h,i)=> obj[h] = row[i]);
       return obj;
     });
+  }
+
+  getLastMonthSnapshot(monthStr){
+    if (!monthStr) throw new Error("Config month is required");
+    const [yearStr, monthOnlyStr] = String(monthStr).split("-");
+    const year = Number(yearStr);
+    const monthIndex = Number(monthOnlyStr) - 1;
+    if (!year || Number.isNaN(monthIndex)) {
+      throw new Error(`Invalid month format: ${monthStr}`);
+    }
+    const prevMonthStart = new Date(year, monthIndex - 1, 1);
+    const prevMonthEnd = new Date(year, monthIndex, 0);
+    const daysInPrevMonth = prevMonthEnd.getDate();
+
+    const sh = this.ss.getSheetByName("LAST");
+    const seedMatrix = new Map();
+    if (!sh) return seedMatrix;
+    const values = sh.getDataRange().getValues();
+    if (values.length < 3) return seedMatrix;
+
+    const headerRow = values[0] || [];
+    const secondRow = values[1] || [];
+    const dayRow = Number(secondRow[2]) ? secondRow : headerRow;
+    const dayNumbers = dayRow.slice(2).map(v => Number(v));
+    if (!dayNumbers.some(v => Number.isFinite(v))) return seedMatrix;
+
+    for (let rowIdx = 2; rowIdx < values.length; rowIdx += 1) {
+      const row = values[rowIdx];
+      const empId = String(row[0] || "").trim();
+      if (!empId) continue;
+      if (!seedMatrix.has(empId)) seedMatrix.set(empId, new Map());
+      const byDate = seedMatrix.get(empId);
+      for (let colIdx = 2; colIdx < row.length && colIdx - 2 < dayNumbers.length; colIdx += 1) {
+        const dayNum = dayNumbers[colIdx - 2];
+        if (!dayNum || dayNum > daysInPrevMonth) continue;
+        const date = new Date(prevMonthStart.getFullYear(), prevMonthStart.getMonth(), dayNum);
+        const code = row[colIdx];
+        if (code === "" || code === null) continue;
+        byDate.set(Utilities.formatDate(date, "Asia/Taipei", "yyyy-MM-dd"), code);
+      }
+    }
+    return seedMatrix;
+  }
+
+  validateRangeValues_(range, values, context){
+    const rangeRows = range.getNumRows();
+    const rangeCols = range.getNumColumns();
+    const valueRows = values.length;
+    const valueCols = valueRows > 0 ? values[0].length : 0;
+    const isRect = values.every(row => row.length === valueCols);
+    if (!isRect || rangeRows !== valueRows || rangeCols !== valueCols) {
+      Logger.log(`[ERROR] ${context} range rows=${rangeRows} cols=${rangeCols} values rows=${valueRows} cols=${valueCols} rectangular=${isRect}`);
+      throw new Error(`Range size mismatch for ${context}`);
+    }
   }
 }
