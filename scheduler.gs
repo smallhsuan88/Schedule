@@ -132,7 +132,6 @@ class Scheduler {
       throw new Error(`Invalid month format: ${month}`);
     }
 
-    const monthStartDate = new Date(year, monthIndex, 1);
     const monthEndDate = new Date(year, monthIndex + 1, 0);
     const daysInMonth = monthEndDate.getDate();
 
@@ -142,8 +141,8 @@ class Scheduler {
       days.push({ day, dateKey: fmtDate(date), date });
     }
 
-    const windowStartDate = new Date(monthStartDate);
-    windowStartDate.setDate(windowStartDate.getDate() - windowStartDate.getDay());
+    const windowStartDate = new Date(monthEndDate);
+    windowStartDate.setDate(windowStartDate.getDate() - 34);
     const windowLength = 35;
     const windowDays = [];
     for (let i = 0; i < windowLength; i += 1) {

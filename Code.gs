@@ -23,20 +23,17 @@ function buildMonthScheduleMatrix(monthStr, people, fixed, leave, lastSnapshot, 
     throw new Error(`Invalid month format: ${monthStr}`);
   }
 
-  const monthStartDate = new Date(year, monthIndex, 1);
   const monthEndDate = new Date(year, monthIndex + 1, 0);
-  const prevMonthEndDate = new Date(year, monthIndex, 0);
-  const prevMonthStartDate = new Date(year, monthIndex - 1, 1);
-  const prevMonthStartDay = 26;
   const requiredStaff = 3;
   const maxOff = Math.max(0, people.length - requiredStaff);
 
   const dates = [];
-  for (let day = prevMonthStartDay; day <= prevMonthEndDate.getDate(); day += 1) {
-    dates.push(new Date(prevMonthStartDate.getFullYear(), prevMonthStartDate.getMonth(), day));
-  }
-  for (let day = 1; day <= monthEndDate.getDate(); day += 1) {
-    dates.push(new Date(year, monthIndex, day));
+  const windowStart = new Date(monthEndDate);
+  windowStart.setDate(windowStart.getDate() - 34);
+  for (let i = 0; i < 35; i += 1) {
+    const date = new Date(windowStart);
+    date.setDate(windowStart.getDate() + i);
+    dates.push(date);
   }
   if (dates.length !== 35) {
     throw new Error(`dates length must be 35, got ${dates.length}`);
@@ -55,17 +52,15 @@ function buildMonthScheduleMatrix(monthStr, people, fixed, leave, lastSnapshot, 
   Logger.log(`[INFO] dates.length=${dates.length} sunDays/satDays will be computed`);
 
   const leaveSet = new Set(leave.map(entry => `${entry.empId}#${fmtDate(entry.date)}`));
-  const prevMonthDateKeySet = new Set(
-    dates.filter(date => date < monthStartDate).map(date => fmtDate(date))
-  );
+  const windowDateKeySet = new Set(dateKeys);
 
-  // Step A4: 回填 LAST (only prev month segment)
+  // Step A4: 回填 LAST (window-based)
   for (const [empId, lastByDate] of lastSnapshot.entries()) {
     if (!scheduleByEmp.has(empId)) continue;
     const row = scheduleByEmp.get(empId);
     for (const [dateKey, code] of lastByDate.entries()) {
       const idx = dateIndex.get(dateKey);
-      if (idx === undefined || !prevMonthDateKeySet.has(dateKey)) continue;
+      if (idx === undefined || !windowDateKeySet.has(dateKey)) continue;
       row[idx] = code;
     }
   }
